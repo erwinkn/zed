@@ -2838,8 +2838,9 @@ impl Window {
         }
     }
 
-    /// Call to prevent the default action of an event. Currently only used to prevent
-    /// parent elements from becoming focused on mouse down.
+    /// Prevent later default actions for the current event, including parent
+    /// focus on mouse down and native scrolling. Event observers still run
+    /// unless propagation is stopped separately.
     pub fn prevent_default(&mut self) {
         self.default_prevented = true;
     }
@@ -6358,6 +6359,18 @@ impl Window {
     pub fn set_a11y_active_for_tests(&mut self, active: bool) {
         self.a11y.set_active_for_tests(active);
         self.refresh();
+    }
+
+    /// Take the platform input handler for native input-method tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_input_handler_for_tests(&mut self) -> Option<PlatformInputHandler> {
+        self.platform_window.take_input_handler()
+    }
+
+    /// Restore a platform input handler taken for a native input-method test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn restore_input_handler_for_tests(&mut self, handler: PlatformInputHandler) {
+        self.platform_window.set_input_handler(handler);
     }
 
     /// Simulate logical focus in a GPU-backed test without activating or raising

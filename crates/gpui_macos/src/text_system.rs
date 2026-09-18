@@ -236,6 +236,14 @@ fn font_smoothing_allowed_by_user() -> bool {
             CFPreferencesCopyAppValue, kCFPreferencesCurrentApplication,
         };
 
+        // Process-local choice; retain the user's setting without an override.
+        if let Ok(value) = std::env::var("GPUI_FONT_SMOOTHING") {
+            match value.as_str() {
+                "0" => return false,
+                "1" => return true,
+                _ => {}
+            }
+        }
         let key = CFString::new("AppleFontSmoothing");
         let value_ref = unsafe {
             CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), kCFPreferencesCurrentApplication)

@@ -3279,7 +3279,10 @@ impl Interactivity {
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if phase == DispatchPhase::Bubble
+                    && hitbox.should_handle_scroll(window)
+                    && !window.default_prevented()
+                {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
@@ -3322,9 +3325,10 @@ impl Interactivity {
                     scroll_offset.x = (scroll_offset.x + delta_x).clamp(-scroll_max.x, px(0.));
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
-                        // A wheel event belongs to the innermost container that
-                        // can move. At its boundary the event may chain outward.
-                        cx.stop_propagation();
+                        // Consume the default scroll action, while allowing
+                        // wheel observers on this element and its ancestors.
+                        // A later event at the boundary can scroll a parent.
+                        window.prevent_default();
                     }
                 }
             });
@@ -4808,6 +4812,7 @@ mod tests {
         outer: ScrollHandle,
         inner: ScrollHandle,
         list: Option<crate::ListState>,
+        wheel_observations: std::rc::Rc<std::cell::Cell<usize>>,
     }
     impl Render for NestedScrollTestView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -4830,6 +4835,7 @@ mod tests {
                     .child(div().h(px(300.)).w_full())
                     .into_any_element()
             };
+            let observations = self.wheel_observations.clone();
             div()
                 .id("outer")
                 .flex()
@@ -4838,6 +4844,7 @@ mod tests {
                 .h(px(200.))
                 .overflow_y_scroll()
                 .track_scroll(&self.outer)
+                .on_scroll_wheel(move |_, _, _| observations.set(observations.get() + 1))
                 .child(inner)
                 .child(div().h(px(600.)).flex_shrink_0())
         }
@@ -4849,6 +4856,7 @@ mod tests {
             let cx = cx.add_empty_window();
             let outer = ScrollHandle::new();
             let inner = ScrollHandle::new();
+            let wheel_observations = std::rc::Rc::new(std::cell::Cell::new(0));
             let list = use_list.then(|| {
                 crate::ListState::new(10, crate::ListAlignment::Top, px(20.))
                     .with_uniform_item_height(px(30.))
@@ -4858,6 +4866,7 @@ mod tests {
                     outer: outer.clone(),
                     inner: inner.clone(),
                     list: list.clone(),
+                    wheel_observations: wheel_observations.clone(),
                 })
                 .into_any_element()
             });
@@ -4871,6 +4880,10 @@ mod tests {
                 "outer fixture must be scrollable"
             );
             cx.simulate_event(wheel(-50.));
+            assert_eq!(
+                wheel_observations.get(), 1,
+                "native scroll must preserve wheel observers"
+            );
             assert_eq!(
                 outer.offset().y,
                 px(0.),
@@ -4895,6 +4908,10 @@ mod tests {
                 "a subsequent event at the boundary chains outward; list={use_list}, inner={:?}, list_offset={:?}",
                 inner.offset(),
                 list.as_ref().map(|list| list.logical_scroll_top())
+            );
+            assert_eq!(
+                wheel_observations.get(), 3,
+                "boundary chaining preserves wheel observers"
             );
         }
     }
