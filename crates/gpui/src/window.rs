@@ -6355,6 +6355,14 @@ impl Window {
         self.refresh();
     }
 
+    /// Simulate logical focus in a GPU-backed test without activating or raising
+    /// the platform window. Offscreen input tests need focus/blur observers too.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_logical_active_for_tests(&mut self, active: bool) {
+        self.active.set(active);
+        self.refresh();
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.

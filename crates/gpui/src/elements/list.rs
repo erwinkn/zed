@@ -550,6 +550,31 @@ impl ListState {
         }
     }
 
+    /// Update focus ownership without replacing items, their size hints, or the scroll anchor.
+    /// This is useful when a virtualized host mounts or unmounts controls within existing rows.
+    pub fn set_item_focus_handles(
+        &self,
+        start: usize,
+        handles: impl IntoIterator<Item = Option<FocusHandle>>,
+    ) {
+        let state = &mut *self.0.borrow_mut();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut next = cursor.slice(&Count(start), Bias::Right);
+        for handle in handles {
+            let Some(item) = cursor.item() else { break };
+            let mut item = item.clone();
+            match &mut item {
+                ListItem::Measured { focus_handle, .. }
+                | ListItem::Unmeasured { focus_handle, .. } => *focus_handle = handle,
+            }
+            next.push(item, ());
+            cursor.next();
+        }
+        next.append(cursor.suffix(), ());
+        drop(cursor);
+        state.items = next;
+    }
+
     /// Set a handler that will be called when the list is scrolled.
     pub fn set_scroll_handler(
         &self,
@@ -921,6 +946,12 @@ impl StateInner {
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+        // Events can coalesce before the next paint. Compare with the current
+        // logical position, not the anchor captured by the last painted frame.
+        let old_scroll_top = self
+            .scroll_top(&self.logical_scroll_top())
+            .max(px(0.))
+            .min(scroll_max);
         let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
             .max(px(0.))
             .min(scroll_max);
@@ -965,6 +996,9 @@ impl StateInner {
         }
 
         cx.notify(current_view);
+        if new_scroll_top != old_scroll_top {
+            cx.stop_propagation();
+        }
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -3020,6 +3054,28 @@ mod test {
              the bottom of its track, even when content has grown during the drag \
              (so frozen_bottom < live_bottom)"
         );
+    }
+
+    #[gpui::test]
+    fn test_focus_updates_preserve_estimates_and_anchor(cx: &mut TestAppContext) {
+        let state = ListState::new(100_000, crate::ListAlignment::Top, px(70.))
+            .with_uniform_item_height(px(35.));
+        let handle = cx
+            .new(|cx| cx.focus_handle())
+            .read_with(cx, |handle, _| handle.clone());
+        state.scroll_to(crate::ListOffset {
+            item_ix: 50_000,
+            offset_in_item: px(7.),
+        });
+        state.set_item_focus_handles(0, (0..128).map(|_| Some(handle.clone())));
+        assert_eq!(state.0.borrow().items.summary().height, px(3_500_000.));
+        assert_eq!(state.logical_scroll_top().item_ix, 50_000);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(7.));
+        state.set_item_focus_handles(0, (0..128).map(|_| None));
+        state.set_item_focus_handles(50_000, std::iter::once(Some(handle)));
+        assert_eq!(state.0.borrow().items.summary().height, px(3_500_000.));
+        assert_eq!(state.item_count(), 100_000);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(7.));
     }
 
     #[gpui::test]

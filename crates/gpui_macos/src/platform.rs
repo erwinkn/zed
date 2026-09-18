@@ -15,7 +15,7 @@ use cocoa::{
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSString,
+        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSRect, NSString,
         NSUInteger, NSURL,
     },
 };
@@ -24,7 +24,7 @@ use core_foundation::{
     boolean::CFBoolean,
     data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
-    runloop::{CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode},
+    runloop::{CFRunLoopRun, kCFRunLoopDefaultMode},
     string::{CFString, CFStringRef},
 };
 use ctor::ctor;
@@ -301,6 +301,34 @@ impl MacPlatform {
         }
 
         self.finish_embedded_run()
+    }
+
+    /// Queue pointer events in this application's own AppKit queue. Tests use
+    /// this to exercise the real embedded pump, rather than direct GPUI input.
+    #[cfg(feature = "test-support")]
+    pub fn queue_test_mouse_moves(&self, count: u32, x: f64, y: f64, delta_y: f64) {
+        assert_main_thread("MacPlatform::queue_test_mouse_moves");
+        unsafe {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            let windows: id = msg_send![app, windows];
+            let window_count: NSUInteger = msg_send![windows, count];
+            if window_count == 0 {
+                return;
+            }
+            let window: id = msg_send![windows, objectAtIndex: 0usize];
+            let number: NSInteger = msg_send![window, windowNumber];
+            let view: id = msg_send![window, contentView];
+            let bounds: NSRect = msg_send![view, bounds];
+            for index in 0..count {
+                let event = <id as NSEvent>::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
+                    nil, NSEventType::NSMouseMoved,
+                    NSPoint::new(x, bounds.size.height - y - (index % 2) as f64 * delta_y),
+                    NSEventModifierFlags::empty(), 0.0, number, nil,
+                    index as NSInteger, 0, 0.0,
+                );
+                app.postEvent_atStart_(event, NO);
+            }
+        }
     }
 
     fn finish_embedded_run(&self) -> bool {
@@ -629,6 +657,13 @@ unsafe fn pump_app_nonblocking() {
         let distant_past: id = msg_send![class!(NSDate), distantPast];
         let mode = kCFRunLoopDefaultMode as id;
 
+        // nextEvent also services timers and display sources. An event-count
+        // limit alone can hold the foreign runtime for hundreds of ms while
+        // new events keep arriving. Yield after a short slice of ready work;
+        // unprocessed events remain in AppKit's queue for the next host tick.
+        // This is a cooperative budget: one AppKit call can exceed it.
+        const EVENT_SLICE: std::time::Duration = std::time::Duration::from_millis(4);
+        let started = std::time::Instant::now();
         for _ in 0..256 {
             let event: id = msg_send![app,
                 nextEventMatchingMask: NSUInteger::MAX
@@ -640,9 +675,14 @@ unsafe fn pump_app_nonblocking() {
                 break;
             }
             let _: () = msg_send![app, sendEvent: event];
+            if started.elapsed() >= EVENT_SLICE {
+                break;
+            }
         }
         let _: () = msg_send![app, updateWindows];
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1);
+        // nextEvent already pumped this mode, even when it returned nil.
+        // A second CFRunLoopRunInMode pass can draw again before the host gets
+        // a turn, delaying input, promises and the next display wake.
     }
 }
 

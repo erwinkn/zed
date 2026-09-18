@@ -130,6 +130,14 @@ struct LinearColorStop {
     percentage: f32,
 }
 
+struct IridescentSweep {
+    palette_a: array<f32, 3>, palette_b: array<f32, 3>,
+    palette_c: array<f32, 3>, palette_d: array<f32, 3>,
+    progress: f32, time: f32, alpha: f32, direction: f32,
+    band_tight: f32, wave_amount: f32, ripple_amount: f32, wave_speed: f32,
+    brightness: f32, swell_amount: f32, hue_shift: f32, padding: f32,
+}
+
 struct Background {
     // 0u is Solid
     // 1u is LinearGradient
@@ -143,6 +151,7 @@ struct Background {
     gradient_angle_or_pattern_height: f32,
     colors: array<LinearColorStop, 2>,
     pad: u32,
+    sweep: IridescentSweep,
 }
 
 struct AtlasTextureId {
@@ -423,9 +432,116 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
             result.color0 = linear_srgb_to_oklab(result.color0);
             result.color1 = linear_srgb_to_oklab(result.color1);
         }
+        // Interpolate premultiplied components in the chosen color space.
+        result.color0 = vec4<f32>(result.color0.rgb * result.color0.a, result.color0.a);
+        result.color1 = vec4<f32>(result.color1.rgb * result.color1.a, result.color1.a);
     }
 
     return result;
+}
+
+// Port of Glimm 0.3.0 shader.ts, MIT, Noman Ijaz. See GLIMM-LICENSE in the GPUI workspace.
+fn sweep_palette(t: f32, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
+  return a + b * cos(2.0 * M_PI_F * (c * t + d));
+}
+fn sweep_color(s: IridescentSweep, coordinates: vec2<f32>) -> vec4<f32> {
+
+  var uv = vec2<f32>(coordinates.x, 1.0-coordinates.y);
+  let uDirection = select(0.0, 1.0, s.direction >= 2.0);
+  let forward = s.direction == 0.0 || s.direction == 3.0;
+  let uPosStart = select(1.2, -0.2, forward);
+  let uPosEnd = select(-0.2, 1.2, forward);
+  let axis = mix(uv.x, uv.y, uDirection);
+  let cross = mix(uv.y, uv.x, uDirection);
+
+  let pos = uPosStart + s.progress * (uPosEnd - uPosStart);
+
+  let tw = s.time * s.wave_speed;
+
+  // One shallow bend keeps the silhouette organic without reading as a
+  // wave. It moves less than 0.5% of the viewport and drifts slowly enough
+  // to feel shaped rather than animated; richer motion stays inside the
+  // foil texture below instead of distorting the band's sides.
+  var waveX = sin(cross * 4.2 + tw * 0.08 + 0.3) * 0.004;
+  waveX *= s.wave_amount;
+
+  let d = (axis - pos) - waveX;
+  let band = exp(-d * d * s.band_tight);
+
+  // Analytic slope of the band's pseudo-elevation map along the travel
+  // axis only. We deliberately ignore the cross-axis chain-rule term
+  // (\u2202waveX/\u2202cross) \u2014 letting the high-frequency edge wobble leak into
+  // the normal made iridescence shimmer at the wave's frequency, which
+  // read as "too wavy". Keeping the cross slope at zero gives a clean
+  // left\u2192right hue sweep that matches the iOS name-drop feel.
+  let dhDaxis = -2.0 * d * s.band_tight * band;
+  var slope = vec2<f32>(0.0);
+  slope.x = mix(dhDaxis, 0.0, uDirection);
+  slope.y = mix(0.0, dhDaxis, uDirection);
+
+  // Synthesised surface normal. The 0.18 gain controls perceived
+  // height \u2014 higher = steeper flanks, more dramatic iridescent shift.
+  let N = normalize(vec3<f32>(-slope.x * 0.18, slope.y * 0.18, 1.0));
+
+  // Match the wider wake and edge taper used by the Harness's pinned Glimm 0.3.0.
+  var trail = clamp(0.5 - d * 1.3, 0.0, 1.0);
+  trail = pow(trail, 2.5) * 0.30;
+  let midpointFocus = 4.0 * s.progress * (1.0 - s.progress);
+  let halo = exp(-d * d * 2.5) * 0.12 * midpointFocus;
+  var intensity = max(band, trail);
+  intensity = clamp(intensity + halo * (1.0 - band), 0.0, 1.0);
+  let vfade = smoothstep(0.0, 0.015, cross)
+              * (1.0 - smoothstep(0.985, 1.0, cross));
+
+  // Hue rotates with the synthesised normal \u2014 the trick that reads as
+  // iOS-name-drop iridescence \u2014 but on a deliberately gentle scale so
+  // the foil shift looks calm, not strobing.
+  // Ripple changes the foil texture, not the edge geometry. Keeping those
+  // responsibilities separate lets the band stay calm while its colour
+  // still feels alive.
+  let ripple = sin(cross * 12.0 + axis * 3.0 + tw * 0.40)
+               * 0.015 * s.ripple_amount;
+  let t = N.x * 0.12 + N.y * 0.08
+          + axis * 0.90 + cross * 0.16
+          + ripple + s.hue_shift + s.time * 0.04;
+  // Low-pass the cosine palette across neighbouring samples. This keeps
+  // adjacent hues flowing into one another instead of forming hard colour
+  // lanes when the surface normal changes around the crest.
+  var col = sweep_palette(t, vec3<f32>(s.palette_a[0],s.palette_a[1],s.palette_a[2]), vec3<f32>(s.palette_b[0],s.palette_b[1],s.palette_b[2]), vec3<f32>(s.palette_c[0],s.palette_c[1],s.palette_c[2]), vec3<f32>(s.palette_d[0],s.palette_d[1],s.palette_d[2])) * 0.50
+           + sweep_palette(t - 0.18, vec3<f32>(s.palette_a[0],s.palette_a[1],s.palette_a[2]), vec3<f32>(s.palette_b[0],s.palette_b[1],s.palette_b[2]), vec3<f32>(s.palette_c[0],s.palette_c[1],s.palette_c[2]), vec3<f32>(s.palette_d[0],s.palette_d[1],s.palette_d[2])) * 0.25
+           + sweep_palette(t + 0.18, vec3<f32>(s.palette_a[0],s.palette_a[1],s.palette_a[2]), vec3<f32>(s.palette_b[0],s.palette_b[1],s.palette_b[2]), vec3<f32>(s.palette_c[0],s.palette_c[1],s.palette_c[2]), vec3<f32>(s.palette_d[0],s.palette_d[1],s.palette_d[2])) * 0.25;
+  col *= s.brightness;
+
+  // Fixed key light + camera looking down +z. View-independent because
+  // there's no real camera; this gives a stable highlight that travels
+  // across the crest as the band moves, instead of one that wobbles with
+  // viewport size.
+  let V = vec3<f32>(0.0, 0.0, 1.0);
+  let L = normalize(vec3<f32>(0.35, 0.55, 0.9));
+  let H = normalize(L + V);
+  let NdotH = clamp(dot(N, H), 0.0, 1.0);
+  let NdotV = clamp(dot(N, V), 0.0, 1.0);
+  let fresnel = pow(1.0 - NdotV, 3.0);
+  let spec = pow(NdotH, 80.0);
+
+  // Edge fade: as the band's traversal progress nears 0 or 1 (entering or
+  // exiting the screen) the band reads at 20% alpha; at midpoint it's at
+  // 100%. Softens the band's appearance/disappearance so it doesn't pop
+  // into existence at full strength.
+  let entryFade = mix(0.2, 1.0, 4.0 * s.progress * (1.0 - s.progress));
+
+  // Body \u2014 palette colour where the band has presence. Premultiplied.
+  let bodyA = intensity * vfade * s.alpha * entryFade;
+  let bodyPM = col * bodyA;
+
+  // Highlights are emissive \u2014 they add light without occluding the page,
+  // gated to the band's body so they only fire on the crest, not the wake.
+  let highMask = band * vfade * s.alpha * entryFade * s.swell_amount;
+  let highEmit = (col * fresnel * 0.55 + vec3<f32>(spec) * 1.1) * highMask;
+  let highA = (fresnel * 0.4 + spec * 0.9) * highMask;
+
+  let alpha = min(bodyA + highA, 1.0);
+  return vec4<f32>((bodyPM + highEmit) / max(alpha, 0.000001), alpha);
 }
 
 fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
@@ -433,6 +549,10 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
     var background_color = vec4<f32>(0.0);
 
     switch (background.tag) {
+        case 4u: {
+            let uv = (position - bounds.origin) / max(bounds.size, vec2<f32>(1.0));
+            return srgba_to_linear(sweep_color(background.sweep, uv));
+        }
         default: {
             return solid_color;
         }
@@ -468,13 +588,18 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
             t = (t - stop0_percentage) / (stop1_percentage - stop0_percentage);
             t = clamp(t, 0.0, 1.0);
 
+            var interpolated = mix(color0, color1, t);
+            if (interpolated.a > 0.0) {
+                interpolated = vec4<f32>(interpolated.rgb / interpolated.a, interpolated.a);
+            } else {
+                interpolated = vec4<f32>(0.0);
+            }
             switch (background.color_space) {
                 default: {
-                    background_color = srgba_to_linear(mix(color0, color1, t));
+                    background_color = srgba_to_linear(interpolated);
                 }
                 case 1u: {
-                    let oklab_color = mix(color0, color1, t);
-                    background_color = oklab_to_linear_srgb(oklab_color);
+                    background_color = oklab_to_linear_srgb(interpolated);
                 }
             }
         }

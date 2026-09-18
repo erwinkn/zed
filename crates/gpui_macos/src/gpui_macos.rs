@@ -47,6 +47,7 @@ use std::{
 
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
+pub use display_link::set_embedded_frame_waker;
 pub(crate) use display_link::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;

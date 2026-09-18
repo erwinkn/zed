@@ -747,6 +747,7 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    IridescentSweep = 4,
 }
 
 /// A color space for color interpolation.
@@ -773,6 +774,54 @@ impl Display for ColorSpace {
     }
 }
 
+/// Parameters for an iridescent, cosine-palette sweep evaluated by the GPU.
+/// All positions are relative to the painted bounds, so resizing needs no texture rebuild.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[repr(C)]
+pub struct IridescentSweep {
+    /// Cosine palette offset.
+    pub palette_a: [f32; 3],
+    /// Cosine palette amplitude.
+    pub palette_b: [f32; 3],
+    /// Cosine palette frequency.
+    pub palette_c: [f32; 3],
+    /// Cosine palette phase.
+    pub palette_d: [f32; 3],
+    /// Traversal in 0..1.
+    pub progress: f32,
+    /// Elapsed seconds for internal texture motion.
+    pub time: f32,
+    /// Overall effect alpha.
+    pub alpha: f32,
+    /// 0 left-to-right, 1 right-to-left, 2 top-to-bottom, 3 bottom-to-top.
+    pub direction: f32,
+    /// Positive Gaussian band sharpness.
+    pub band_tight: f32,
+    /// Edge displacement intensity.
+    pub wave_amount: f32,
+    /// Internal ripple intensity.
+    pub ripple_amount: f32,
+    /// Internal motion speed.
+    pub wave_speed: f32,
+    /// Palette brightness multiplier.
+    pub brightness: f32,
+    /// Crest illumination intensity.
+    pub swell_amount: f32,
+    /// Additional palette phase.
+    pub hue_shift: f32,
+    /// Reserved for GPU layout compatibility.
+    pub padding: f32,
+}
+
+/// Create a procedural iridescent sweep. Animation timing belongs to the caller.
+pub fn iridescent_sweep(sweep: IridescentSweep) -> Background {
+    Background {
+        tag: BackgroundTag::IridescentSweep,
+        sweep,
+        ..Default::default()
+    }
+}
+
 /// A background color, which can be either a solid color or a linear gradient.
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
@@ -784,11 +833,15 @@ pub struct Background {
     pub(crate) colors: [LinearColorStop; 2],
     /// Padding for alignment for repr(C) layout.
     pad: u32,
+    /// Optional procedural sweep payload; unused for other background tags.
+    #[serde(default)]
+    pub(crate) sweep: IridescentSweep,
 }
 
 impl std::fmt::Debug for Background {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.tag {
+            BackgroundTag::IridescentSweep => write!(f, "IridescentSweep({:?})", self.sweep),
             BackgroundTag::Solid => write!(f, "Solid({:?})", self.solid),
             BackgroundTag::LinearGradient => write!(
                 f,
@@ -819,6 +872,7 @@ impl Default for Background {
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
             pad: 0,
+            sweep: IridescentSweep::default(),
         }
     }
 }
@@ -929,6 +983,7 @@ impl Background {
     pub fn opacity(&self, factor: f32) -> Self {
         let mut background = *self;
         background.solid = background.solid.opacity(factor);
+        background.sweep.alpha *= factor;
         background.colors = [
             self.colors[0].opacity(factor),
             self.colors[1].opacity(factor),
@@ -939,6 +994,7 @@ impl Background {
     /// Returns whether the background color is transparent.
     pub fn is_transparent(&self) -> bool {
         match self.tag {
+            BackgroundTag::IridescentSweep => self.sweep.alpha <= 0.,
             BackgroundTag::Solid => self.solid.is_transparent(),
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),

@@ -64,6 +64,14 @@ use std::{
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
 
+/// Wake an embedded host loop when the display has queued a frame. The callback
+/// runs on CoreVideo's thread and must only enqueue work on the host UI thread.
+pub fn set_embedded_frame_waker(waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    *FRAME_WAKER.lock().unwrap_or_else(PoisonError::into_inner) = waker;
+}
+static FRAME_WAKER: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+
 struct Registry {
     displays: BTreeMap<CGDirectDisplayID, DisplayEntry>,
     next_subscriber_id: u64,
@@ -131,6 +139,9 @@ unsafe extern "C" fn display_link_output_callback(
             frame_requests.merge_data(1);
         }
     }
+    drop(registry);
+    let wake = FRAME_WAKER.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if let Some(wake) = wake { wake(); }
     0
 }
 

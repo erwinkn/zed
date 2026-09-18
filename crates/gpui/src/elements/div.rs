@@ -1377,6 +1377,18 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Mark an accessible control as unavailable without removing its label.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
+        self
+    }
+
+    /// Mark a dialog as modal for assistive technology.
+    fn aria_modal(mut self, modal: bool) -> Self {
+        self.interactivity().aria.modal = modal;
+        self
+    }
+
     /// Set the toggled state for this element.
     fn aria_toggled(mut self, toggled: accesskit::Toggled) -> Self {
         self.interactivity().aria.toggled = Some(toggled);
@@ -1942,10 +1954,6 @@ impl Element for Div {
             (child_max - child_min).into()
         };
 
-        if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
-            scroll_handle.scroll_to_active_item();
-        }
-
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2040,6 +2048,8 @@ pub(crate) struct AriaProperties {
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
+    pub(crate) disabled: bool,
+    pub(crate) modal: bool,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
@@ -2076,6 +2086,7 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) scroll_max: Point<Pixels>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
@@ -2318,6 +2329,9 @@ impl Interactivity {
                                 None
                             };
 
+                            if let Some(handle) = self.tracked_scroll_handle.as_ref() {
+                                handle.scroll_to_active_item_in(bounds, style.overflow);
+                            }
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
                             let result = f(&style, scroll_offset, hitbox, window, cx);
@@ -2362,7 +2376,7 @@ impl Interactivity {
     }
 
     fn clamp_scroll_position(
-        &self,
+        &mut self,
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
@@ -2397,6 +2411,7 @@ impl Interactivity {
             let scroll_max = Point::from(padded_content_size - bounds.size)
                 .map(round_to_two_decimals)
                 .max(&Default::default());
+            self.scroll_max = scroll_max;
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3256,6 +3271,7 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let scroll_max = self.scroll_max;
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
@@ -3302,10 +3318,13 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    scroll_offset.y = (scroll_offset.y + delta_y).clamp(-scroll_max.y, px(0.));
+                    scroll_offset.x = (scroll_offset.x + delta_x).clamp(-scroll_max.x, px(0.));
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
+                        // A wheel event belongs to the innermost container that
+                        // can move. At its boundary the event may chain outward.
+                        cx.stop_propagation();
                     }
                 }
             });
@@ -3469,6 +3488,12 @@ impl Interactivity {
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);
+        }
+        if self.aria.disabled {
+            node.set_disabled();
+        }
+        if self.aria.modal {
+            node.set_modal();
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
@@ -4198,6 +4223,16 @@ impl ScrollHandle {
         });
     }
 
+    /// Resolve pending item requests against this frame, including initial layout and resize.
+    fn scroll_to_active_item_in(&self, bounds: Bounds<Pixels>, overflow: Point<Overflow>) {
+        {
+            let mut state = self.0.borrow_mut();
+            state.bounds = bounds;
+            state.overflow = overflow;
+        }
+        self.scroll_to_active_item();
+    }
+
     /// Scrolls the minimal amount to either ensure that the child is
     /// fully visible or the top element of the view depends on the
     /// scroll strategy
@@ -4303,8 +4338,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers, MouseMoveEvent,
-        TestAppContext, canvas, svg, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
+        MouseMoveEvent, TestAppContext, canvas, svg, util::FluentBuilder as _,
     };
     use std::{
         cell::{Cell, RefCell},
@@ -4767,6 +4802,120 @@ mod tests {
                 captured_active_tooltip: self.captured_active_tooltip.clone(),
             }
         }
+    }
+
+    struct NestedScrollTestView {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+        list: Option<crate::ListState>,
+    }
+    impl Render for NestedScrollTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let inner = if let Some(state) = self.list.as_ref() {
+                crate::list(state.clone(), |_, _, _| {
+                    div().h(px(30.)).w_full().into_any_element()
+                })
+                .w_full()
+                .h(px(100.))
+                .flex_shrink_0()
+                .into_any_element()
+            } else {
+                div()
+                    .id("inner")
+                    .w_full()
+                    .h(px(100.))
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.inner)
+                    .child(div().h(px(300.)).w_full())
+                    .into_any_element()
+            };
+            div()
+                .id("outer")
+                .flex()
+                .flex_col()
+                .w(px(100.))
+                .h(px(200.))
+                .overflow_y_scroll()
+                .track_scroll(&self.outer)
+                .child(inner)
+                .child(div().h(px(600.)).flex_shrink_0())
+        }
+    }
+
+    #[gpui::test]
+    fn nested_scrollers_consume_movement_and_chain_at_the_boundary(cx: &mut TestAppContext) {
+        for use_list in [false, true] {
+            let cx = cx.add_empty_window();
+            let outer = ScrollHandle::new();
+            let inner = ScrollHandle::new();
+            let list = use_list.then(|| {
+                crate::ListState::new(10, crate::ListAlignment::Top, px(20.))
+                    .with_uniform_item_height(px(30.))
+            });
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, cx| {
+                cx.new(|_| NestedScrollTestView {
+                    outer: outer.clone(),
+                    inner: inner.clone(),
+                    list: list.clone(),
+                })
+                .into_any_element()
+            });
+            let wheel = |delta| crate::ScrollWheelEvent {
+                position: point(px(10.), px(10.)),
+                delta: crate::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                ..Default::default()
+            };
+            assert!(
+                outer.0.borrow().max_offset.y > px(0.),
+                "outer fixture must be scrollable"
+            );
+            cx.simulate_event(wheel(-50.));
+            assert_eq!(
+                outer.offset().y,
+                px(0.),
+                "inner movement must not move the outer container"
+            );
+            if let Some(list) = &list {
+                assert_eq!(list.logical_scroll_top().item_ix, 1);
+                assert_eq!(list.logical_scroll_top().offset_in_item, px(20.));
+            } else {
+                assert_eq!(inner.offset().y, px(-50.));
+            }
+            cx.simulate_event(wheel(-1000.));
+            assert_eq!(
+                outer.offset().y,
+                px(0.),
+                "the event that reaches the inner boundary is consumed"
+            );
+            cx.simulate_event(wheel(-50.));
+            assert_eq!(
+                outer.offset().y,
+                px(-50.),
+                "a subsequent event at the boundary chains outward; list={use_list}, inner={:?}, list_offset={:?}",
+                inner.offset(),
+                list.as_ref().map(|list| list.logical_scroll_top())
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_handle_reveals_item_with_current_frame_geometry() {
+        let handle = ScrollHandle::new();
+        handle.0.borrow_mut().child_bounds =
+            vec![Bounds::new(point(px(240.), px(0.)), size(px(80.), px(24.)))];
+        handle.scroll_to_item(0);
+        handle.scroll_to_active_item_in(
+            Bounds::new(point(px(0.), px(0.)), size(px(160.), px(24.))),
+            point(Overflow::Scroll, Overflow::Hidden),
+        );
+        assert_eq!(handle.offset().x, px(-160.));
+        handle.scroll_to_item(0);
+        handle.scroll_to_active_item_in(
+            Bounds::new(point(px(0.), px(0.)), size(px(120.), px(24.))),
+            point(Overflow::Scroll, Overflow::Hidden),
+        );
+        assert_eq!(handle.offset().x, px(-200.));
     }
 
     #[test]
@@ -5450,9 +5599,21 @@ mod tests {
                 events,
             }
         });
-        cx.simulate_mouse_down(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(point(px(200.), px(10.)), MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(point(px(200.), px(10.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(200.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(200.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         assert_eq!(
             events.borrow().as_slice(),
             ["down", "handle-move", "handle-up"]
@@ -5469,14 +5630,26 @@ mod tests {
                 events,
             }
         });
-        cx.simulate_mouse_down(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         view.update(cx, |view, cx| {
             view.removed = true;
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_mouse_move(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         assert_eq!(
             events.borrow().as_slice(),
             ["down", "other-move", "other-up"]

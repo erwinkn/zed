@@ -20,6 +20,7 @@ pub struct Anchored {
     anchor_position: Option<Point<Pixels>>,
     position_mode: AnchoredPositionMode,
     offset: Option<Point<Pixels>>,
+    match_parent_width: bool,
 }
 
 /// anchored gives you an element that will avoid overflowing the window bounds.
@@ -32,10 +33,17 @@ pub fn anchored() -> Anchored {
         anchor_position: None,
         position_mode: AnchoredPositionMode::Window,
         offset: None,
+        match_parent_width: false,
     }
 }
 
 impl Anchored {
+    /// Constrain the floating content to its containing block's width in this layout pass.
+    pub fn match_parent_width(mut self) -> Self {
+        self.match_parent_width = true;
+        self
+    }
+
     /// Sets which corner of the anchored element should be anchored to the current position.
     pub fn anchor(mut self, anchor: Anchor) -> Self {
         self.anchor = anchor;
@@ -108,12 +116,15 @@ impl Element for Anchored {
             .map(|child| child.request_layout(window, cx))
             .collect::<SmallVec<_>>();
 
-        let anchored_style = Style {
+        let mut anchored_style = Style {
             position: Position::Absolute,
             display: Display::Flex,
             ..Style::default()
         };
 
+        if self.match_parent_width {
+            anchored_style.size.width = crate::relative(1.0).into();
+        }
         let layout_id = window.request_layout(anchored_style, child_layout_ids.iter().copied(), cx);
 
         (layout_id, AnchoredState { child_layout_ids })

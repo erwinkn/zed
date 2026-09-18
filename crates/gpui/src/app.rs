@@ -1709,17 +1709,22 @@ impl App {
                 }
             } else {
                 #[cfg(any(test, feature = "test-support", feature = "bench"))]
-                for window in self
-                    .windows
-                    .values()
-                    .filter_map(|window| {
-                        let window = window.as_deref()?;
-                        window.invalidator.is_dirty().then_some(window.handle)
-                    })
-                    .collect::<Vec<_>>()
-                {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
-                        .unwrap();
+                if !matches!(self.mode, GpuiMode::Production) {
+                    // Linking test support must not put a real window on the
+                    // synchronous test draw path. Production coalesces updates
+                    // until the platform requests the next display frame.
+                    for window in self
+                        .windows
+                        .values()
+                        .filter_map(|window| {
+                            let window = window.as_deref()?;
+                            window.invalidator.is_dirty().then_some(window.handle)
+                        })
+                        .collect::<Vec<_>>()
+                    {
+                        self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                            .unwrap();
+                    }
                 }
 
                 if self.pending_effects.is_empty() {
@@ -3120,6 +3125,23 @@ mod test {
             self.0.set(self.0.get() + 1);
             Empty
         }
+    }
+
+    #[gpui::test]
+    fn production_updates_wait_for_frame_even_with_test_support(cx: &mut TestAppContext) {
+        let count = Rc::new(Cell::new(0));
+        let _window = cx.add_window({
+            let count = count.clone();
+            move |_, _| RenderCounter(count)
+        });
+        cx.run_until_parked();
+        let before = count.get();
+        cx.app.borrow_mut().mode = super::GpuiMode::Production;
+        cx.to_async().refresh();
+        assert_eq!(count.get(), before, "production updates must wait for the platform frame");
+        cx.app.borrow_mut().mode = super::GpuiMode::test();
+        cx.to_async().refresh();
+        assert_eq!(count.get(), before + 1, "test windows must still draw synchronously");
     }
 
     #[gpui::test]

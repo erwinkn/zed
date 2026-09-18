@@ -282,6 +282,7 @@ impl MetalRenderer {
             "shadow_vertex",
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let quads_pipeline_state = build_pipeline_state(
             &device,
@@ -290,6 +291,7 @@ impl MetalRenderer {
             "quad_vertex",
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let underlines_pipeline_state = build_pipeline_state(
             &device,
@@ -298,6 +300,7 @@ impl MetalRenderer {
             "underline_vertex",
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -306,6 +309,7 @@ impl MetalRenderer {
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let polychrome_sprites_pipeline_state = build_pipeline_state(
             &device,
@@ -314,6 +318,7 @@ impl MetalRenderer {
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
@@ -322,6 +327,7 @@ impl MetalRenderer {
             "surface_vertex",
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
 
         let command_queue = device.new_command_queue();
@@ -548,17 +554,11 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = layer
-            .next_drawable()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
-
-        let command_buffer = self.render_frame(scene, drawable.texture(), viewport_size)?;
-
-        // Commit and wait for completion without presenting
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-
-        read_texture_to_image(drawable.texture())
+        // A capture must not reserve a CAMetalLayer drawable without presenting
+        // it. In an embedded host its autorelease pool may survive many captures,
+        // exhausting the display pool and blocking nextDrawable for a second.
+        // Use a separate target and drain temporary Metal objects before returning.
+        objc::rc::autoreleasepool(|| self.render_scene_to_image(scene, viewport_size))
     }
 
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
@@ -1276,6 +1276,7 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
+    premultiplied: bool,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
@@ -1293,7 +1294,11 @@ fn build_pipeline_state(
     color_attachment.set_blending_enabled(true);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_source_rgb_blend_factor(if premultiplied {
+        metal::MTLBlendFactor::One
+    } else {
+        metal::MTLBlendFactor::SourceAlpha
+    });
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);

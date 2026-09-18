@@ -97,9 +97,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+float4 quad_color(QuadFragmentInput input, constant Quad *quads) {
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -394,6 +392,15 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+}
+
+// Premultiply before the framebuffer clamps RGB. This preserves emissive sweep
+// highlights whose RGB can exceed alpha, while ordinary quad colors blend identically.
+fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
+                              constant Quad *quads [[buffer(QuadInputIndex_Quads)]]) {
+  float4 color = quad_color(input, quads);
+  color.a = saturate(color.a);
+  return float4(color.rgb * color.a, color.a);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1169,6 +1176,10 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,
       out.color0 = srgb_to_oklab(out.color0);
       out.color1 = srgb_to_oklab(out.color1);
     }
+    // CSS gradients interpolate premultiplied color components. A transparent
+    // endpoint must not contribute black (or its hidden RGB) to the fade.
+    out.color0.rgb *= out.color0.a;
+    out.color1.rgb *= out.color1.a;
   }
 
   return out;
@@ -1180,6 +1191,110 @@ float2x2 rotate2d(float angle) {
     return float2x2(c, -s, s, c);
 }
 
+// Port of Glimm 0.3.0 shader.ts, MIT, Noman Ijaz. See GLIMM-LICENSE in the GPUI workspace.
+float3 sweep_palette(float t, float3 a, float3 b, float3 c, float3 d) {
+  return a + b * cos(2.0 * M_PI_F * (c * t + d));
+}
+float4 sweep_color(IridescentSweep s, float2 uv) {
+
+  uv.y = 1.0 - uv.y;
+  float uDirection = s.direction >= 2.0 ? 1.0 : 0.0;
+  bool forward = s.direction == 0.0 || s.direction == 3.0;
+  float uPosStart = forward ? -0.2 : 1.2;
+  float uPosEnd = forward ? 1.2 : -0.2;
+  float axis  = mix(uv.x, uv.y, uDirection);
+  float cross = mix(uv.y, uv.x, uDirection);
+
+  float pos = uPosStart + s.progress * (uPosEnd - uPosStart);
+
+  float tw = s.time * s.wave_speed;
+
+  // One shallow bend keeps the silhouette organic without reading as a
+  // wave. It moves less than 0.5% of the viewport and drifts slowly enough
+  // to feel shaped rather than animated; richer motion stays inside the
+  // foil texture below instead of distorting the band's sides.
+  float waveX = sin(cross * 4.2 + tw * 0.08 + 0.3) * 0.004;
+  waveX *= s.wave_amount;
+
+  float d = (axis - pos) - waveX;
+  float band = exp(-d * d * s.band_tight);
+
+  // Analytic slope of the band's pseudo-elevation map along the travel
+  // axis only. We deliberately ignore the cross-axis chain-rule term
+  // (\u2202waveX/\u2202cross) \u2014 letting the high-frequency edge wobble leak into
+  // the normal made iridescence shimmer at the wave's frequency, which
+  // read as "too wavy". Keeping the cross slope at zero gives a clean
+  // left\u2192right hue sweep that matches the iOS name-drop feel.
+  float dhDaxis = -2.0 * d * s.band_tight * band;
+  float2 slope;
+  slope.x = mix(dhDaxis, 0.0, uDirection);
+  slope.y = mix(0.0, dhDaxis, uDirection);
+
+  // Synthesised surface normal. The 0.18 gain controls perceived
+  // height \u2014 higher = steeper flanks, more dramatic iridescent shift.
+  float3 N = normalize(float3(-slope.x * 0.18, slope.y * 0.18, 1.0));
+
+  // Match the wider wake and edge taper used by the Harness's pinned Glimm 0.3.0.
+  float trail = clamp(0.5 - d * 1.3, 0.0, 1.0);
+  trail = pow(trail, 2.5) * 0.30;
+  float midpointFocus = 4.0 * s.progress * (1.0 - s.progress);
+  float halo = exp(-d * d * 2.5) * 0.12 * midpointFocus;
+  float intensity = max(band, trail);
+  intensity = clamp(intensity + halo * (1.0 - band), 0.0, 1.0);
+  float vfade = smoothstep(0.0, 0.015, cross)
+              * (1.0 - smoothstep(0.985, 1.0, cross));
+
+  // Hue rotates with the synthesised normal \u2014 the trick that reads as
+  // iOS-name-drop iridescence \u2014 but on a deliberately gentle scale so
+  // the foil shift looks calm, not strobing.
+  // Ripple changes the foil texture, not the edge geometry. Keeping those
+  // responsibilities separate lets the band stay calm while its colour
+  // still feels alive.
+  float ripple = sin(cross * 12.0 + axis * 3.0 + tw * 0.40)
+               * 0.015 * s.ripple_amount;
+  float t = N.x * 0.12 + N.y * 0.08
+          + axis * 0.90 + cross * 0.16
+          + ripple + s.hue_shift + s.time * 0.04;
+  // Low-pass the cosine palette across neighbouring samples. This keeps
+  // adjacent hues flowing into one another instead of forming hard colour
+  // lanes when the surface normal changes around the crest.
+  float3 col = sweep_palette(t, float3(s.palette_a[0],s.palette_a[1],s.palette_a[2]), float3(s.palette_b[0],s.palette_b[1],s.palette_b[2]), float3(s.palette_c[0],s.palette_c[1],s.palette_c[2]), float3(s.palette_d[0],s.palette_d[1],s.palette_d[2])) * 0.50
+           + sweep_palette(t - 0.18, float3(s.palette_a[0],s.palette_a[1],s.palette_a[2]), float3(s.palette_b[0],s.palette_b[1],s.palette_b[2]), float3(s.palette_c[0],s.palette_c[1],s.palette_c[2]), float3(s.palette_d[0],s.palette_d[1],s.palette_d[2])) * 0.25
+           + sweep_palette(t + 0.18, float3(s.palette_a[0],s.palette_a[1],s.palette_a[2]), float3(s.palette_b[0],s.palette_b[1],s.palette_b[2]), float3(s.palette_c[0],s.palette_c[1],s.palette_c[2]), float3(s.palette_d[0],s.palette_d[1],s.palette_d[2])) * 0.25;
+  col *= s.brightness;
+
+  // Fixed key light + camera looking down +z. View-independent because
+  // there's no real camera; this gives a stable highlight that travels
+  // across the crest as the band moves, instead of one that wobbles with
+  // viewport size.
+  float3 V = float3(0.0, 0.0, 1.0);
+  float3 L = normalize(float3(0.35, 0.55, 0.9));
+  float3 H = normalize(L + V);
+  float NdotH = clamp(dot(N, H), 0.0, 1.0);
+  float NdotV = clamp(dot(N, V), 0.0, 1.0);
+  float fresnel = pow(1.0 - NdotV, 3.0);
+  float spec    = pow(NdotH, 80.0);
+
+  // Edge fade: as the band's traversal progress nears 0 or 1 (entering or
+  // exiting the screen) the band reads at 20% alpha; at midpoint it's at
+  // 100%. Softens the band's appearance/disappearance so it doesn't pop
+  // into existence at full strength.
+  float entryFade = mix(0.2, 1.0, 4.0 * s.progress * (1.0 - s.progress));
+
+  // Body \u2014 palette colour where the band has presence. Premultiplied.
+  float bodyA = intensity * vfade * s.alpha * entryFade;
+  float3  bodyPM = col * bodyA;
+
+  // Highlights are emissive \u2014 they add light without occluding the page,
+  // gated to the band's body so they only fire on the crest, not the wake.
+  float highMask = band * vfade * s.alpha * entryFade * s.swell_amount;
+  float3  highEmit = (col * fresnel * 0.55 + float3(spec) * 1.1) * highMask;
+  float highA    = (fresnel * 0.4 + spec * 0.9) * highMask;
+
+  float alpha = min(bodyA + highA, 1.0);
+  return float4((bodyPM + highEmit) / max(alpha, 0.000001), alpha);
+}
+
 float4 fill_color(Background background,
                       float2 position,
                       Bounds_ScaledPixels bounds,
@@ -1187,6 +1302,10 @@ float4 fill_color(Background background,
   float4 color;
 
   switch (background.tag) {
+    case 4: {
+      float2 uv = (position - float2(bounds.origin.x, bounds.origin.y)) / max(float2(bounds.size.width, bounds.size.height), float2(1.0));
+      return sweep_color(background.sweep, uv);
+    }
     case 0:
       color = solid_color;
       break;
@@ -1221,13 +1340,15 @@ float4 fill_color(Background background,
         - background.colors[0].percentage);
       t = clamp(t, 0.0, 1.0);
 
+      float4 interpolated = mix(color0, color1, t);
+      interpolated.rgb = interpolated.a > 0.0
+        ? interpolated.rgb / interpolated.a : float3(0.0);
       switch (background.color_space) {
         case 0:
-          color = mix(color0, color1, t);
+          color = interpolated;
           break;
         case 1: {
-          float4 oklab_color = mix(color0, color1, t);
-          color = oklab_to_srgb(oklab_color);
+          color = oklab_to_srgb(interpolated);
           break;
         }
       }
