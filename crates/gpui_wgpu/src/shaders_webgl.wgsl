@@ -96,27 +96,6 @@ fn read_color_stop(cursor: ptr<function, InstanceCursor>) -> LinearColorStop {
     return LinearColorStop(read_hsla(cursor), read_f32(cursor));
 }
 
-fn read_sweep(cursor: ptr<function, InstanceCursor>) -> IridescentSweep {
-    return IridescentSweep(
-        array<f32, 3>(read_f32(cursor),read_f32(cursor),read_f32(cursor)),
-        array<f32, 3>(read_f32(cursor),read_f32(cursor),read_f32(cursor)),
-        array<f32, 3>(read_f32(cursor),read_f32(cursor),read_f32(cursor)),
-        array<f32, 3>(read_f32(cursor),read_f32(cursor),read_f32(cursor)),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-        read_f32(cursor),
-    );
-}
-
 fn read_background(cursor: ptr<function, InstanceCursor>) -> Background {
     return Background(
         read_word(cursor),
@@ -128,7 +107,6 @@ fn read_background(cursor: ptr<function, InstanceCursor>) -> Background {
             read_color_stop(cursor),
         ),
         read_word(cursor),
-        read_sweep(cursor),
     );
 }
 
@@ -158,7 +136,7 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 }
 
 fn load_quad(instance_id: u32) -> Quad {
-    var cursor = instance_cursor(instance_id * 64u);
+    var cursor = instance_cursor(instance_id * 40u);
     return Quad(
         read_word(&cursor),
         read_word(&cursor),
@@ -188,7 +166,7 @@ fn load_shadow(instance_id: u32) -> Shadow {
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 50u);
+    var cursor = instance_cursor(vertex_id * 26u);
     return PathRasterizationVertex(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),

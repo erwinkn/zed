@@ -1927,6 +1927,17 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
+    fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.0.lock().renderer.gpu_context()))
+    }
+
+    fn gpu_texture_size(
+        &self,
+        texture: &dyn std::any::Any,
+    ) -> anyhow::Result<gpui::Size<gpui::DevicePixels>> {
+        self.0.lock().renderer.gpu_texture_size(texture)
+    }
+
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         None
     }

@@ -4736,7 +4736,9 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            image_buffer,
+            source: crate::SurfaceSource::Surface(image_buffer),
+            corner_radii: Corners::default(),
+            opacity: self.element_opacity(),
         });
     }
 
@@ -4766,9 +4768,41 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            texture,
-            texture_size,
+            source: crate::SurfaceSource::Texture { texture, size: texture_size },
+            corner_radii: Corners::default(),
+            opacity: self.element_opacity(),
         });
+    }
+
+    /// Compose a premultiplied GPU texture in scene order, without CPU readback.
+    ///
+    /// Use this window's `gpu_context` device and queue. Submit texture writes
+    /// before painting, on that queue. Keep RGB in the same colour space as
+    /// the renderer output; RGB may exceed alpha in a floating-point texture.
+    /// Supported backends validate the resource before adding it to the scene.
+    /// Inherited opacity and corner coverage multiply all four channels.
+    pub fn paint_gpu_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: crate::GpuTextureHandle,
+        corner_radii: Corners<Pixels>,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        let size = self.platform_window.gpu_texture_size(texture.as_ref())?;
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size)
+            .scale(self.scale_factor());
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(crate::PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            corner_radii,
+            opacity: self.element_opacity(),
+            source: crate::SurfaceSource::Texture { texture, size },
+        });
+        Ok(())
     }
 
     /// Uploads new pixels for an image, retaining same-sized atlas tiles when possible.
@@ -6256,11 +6290,11 @@ impl Window {
     }
 
     /// Returns the GPU context (device + queue) if available.
-    /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
+    /// Metal returns `(metal::Device, metal::CommandQueue)`. Wgpu returns
+    /// `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`. Submit producer work on this queue.
     ///
     /// Ported from gpui-ce
     /// ([#39](https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477)).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         self.platform_window.gpu_context()
     }
@@ -6273,7 +6307,6 @@ impl Window {
     ///
     /// Ported from gpui-ce
     /// ([#78](https://github.com/gpui-ce/gpui-ce/pull/78)).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn gpu_device_lost(&self) -> Option<bool> {
         self.platform_window.gpu_device_lost()
     }

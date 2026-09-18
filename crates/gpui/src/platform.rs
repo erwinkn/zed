@@ -944,13 +944,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
     /// Returns the GPU context for this window's renderer.
-    /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
+    /// Metal returns `(metal::Device, metal::CommandQueue)`. Wgpu returns
+    /// `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
     ///
     /// Ported from gpui-ce
     /// ([#39](https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477)).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         None
+    }
+
+    /// Validate an external GPU texture and return its dimensions.
+    fn gpu_texture_size(&self, _texture: &dyn std::any::Any) -> Result<Size<DevicePixels>> {
+        anyhow::bail!("GPU texture composition is unavailable on this renderer")
     }
 
     /// Whether this window's GPU device has been lost (the platform renderer
@@ -959,7 +964,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ///
     /// Ported from gpui-ce
     /// ([#78](https://github.com/gpui-ce/gpui-ce/pull/78)).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn gpu_device_lost(&self) -> Option<bool> {
         None
     }
@@ -1026,6 +1030,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 /// A renderer for headless windows that can produce real rendered output.
 #[cfg(any(test, feature = "test-support"))]
 pub trait PlatformHeadlessRenderer {
+    /// Return the renderer's device and submission queue.
+    fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Validate an external GPU texture and return its dimensions.
+    fn gpu_texture_size(&self, _texture: &dyn std::any::Any) -> Result<Size<DevicePixels>> {
+        anyhow::bail!("GPU texture composition is unavailable on this renderer")
+    }
+
     /// Render a scene and return the result as an RGBA image.
     fn render_scene_to_image(
         &mut self,

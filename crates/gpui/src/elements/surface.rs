@@ -2,12 +2,10 @@ use crate::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
 };
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use crate::{DevicePixels, Size};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::sync::Arc;
 
 /// A source of a surface's content.
@@ -17,14 +15,14 @@ pub enum SurfaceSource {
     Surface(CVPixelBuffer),
     /// A GPU texture handle (type-erased to avoid depending on wgpu).
     ///
-    /// Expected to be `Arc<wgpu::Texture>` created on the window's
+    /// Use `Arc<metal::Texture>` on macOS, or `Arc<wgpu::Texture>` on wgpu.
+    /// Create the texture on the window's
     /// [`Window::gpu_context`] device. Ported from gpui-ce
     /// ([#39](https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477),
     /// [#121](https://github.com/gpui-ce/gpui-ce/pull/121)).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     Texture {
         /// The GPU texture, type-erased (expected to be `Arc<wgpu::Texture>`)
-        texture: Arc<dyn std::any::Any + Send + Sync>,
+        texture: crate::GpuTextureHandle,
         /// Dimensions of the texture in device pixels
         size: Size<DevicePixels>,
     },
@@ -35,7 +33,6 @@ impl Clone for SurfaceSource {
         match *self {
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(ref buf) => SurfaceSource::Surface(buf.clone()),
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             SurfaceSource::Texture { ref texture, size } => SurfaceSource::Texture {
                 texture: Arc::clone(texture),
                 size,
@@ -49,7 +46,6 @@ impl std::fmt::Debug for SurfaceSource {
         match *self {
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(ref buf) => f.debug_tuple("Surface").field(buf).finish(),
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             SurfaceSource::Texture { size, .. } => f
                 .debug_struct("Texture")
                 .field("size", &size)
@@ -73,7 +69,6 @@ pub struct Surface {
 }
 
 /// Create a new surface element.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
@@ -152,10 +147,11 @@ impl Element for Surface {
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
             }
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             SurfaceSource::Texture { texture, size } => {
                 let new_bounds = self.object_fit.get_bounds(bounds, *size);
-                window.paint_surface(new_bounds, Arc::clone(texture), *size);
+                if let Err(error) = window.paint_gpu_texture(new_bounds, Arc::clone(texture), Default::default()) {
+                    log::error!("Cannot paint GPU texture: {error}");
+                }
             }
             #[allow(unreachable_patterns)]
             _ => {}
@@ -196,7 +192,7 @@ mod tests {
         #[test]
         fn texture_surface_inserts_into_scene() {
             let mut scene = Scene::default();
-            let texture: Arc<dyn std::any::Any + Send + Sync> = Arc::new(DummyTexture);
+            let texture: crate::GpuTextureHandle = Arc::new(DummyTexture);
             scene.insert_primitive(PaintSurface {
                 order: 0,
                 bounds: bounds(
@@ -209,21 +205,20 @@ mod tests {
                         size(ScaledPixels(64.), ScaledPixels(64.)),
                     ),
                 },
-                texture: Arc::clone(&texture),
-                texture_size: size(DevicePixels(64), DevicePixels(64)),
+                source: SurfaceSource::Texture { texture: Arc::clone(&texture), size: size(DevicePixels(64), DevicePixels(64)) },
+                corner_radii: Default::default(),
+                opacity: 1.0,
             });
             assert_eq!(scene.surfaces.len(), 1);
-            assert!(
-                scene.surfaces[0]
-                    .texture
-                    .downcast_ref::<DummyTexture>()
-                    .is_some()
-            );
-            assert_eq!(scene.surfaces[0].texture_size.width, DevicePixels(64));
+            let SurfaceSource::Texture { texture, size } = &scene.surfaces[0].source else {
+                panic!("expected texture")
+            };
+            assert!(texture.downcast_ref::<DummyTexture>().is_some());
+            assert_eq!(size.width, DevicePixels(64));
         }
 
         struct TextureView {
-            texture: Arc<dyn std::any::Any + Send + Sync>,
+            texture: crate::GpuTextureHandle,
         }
 
         impl Render for TextureView {
@@ -247,7 +242,7 @@ mod tests {
 
         #[gpui::test]
         fn paint_texture_surface_reaches_the_scene(cx: &mut TestAppContext) {
-            let texture: Arc<dyn std::any::Any + Send + Sync> = Arc::new(DummyTexture);
+            let texture: crate::GpuTextureHandle = Arc::new(DummyTexture);
             let window = cx.add_window({
                 let texture = Arc::clone(&texture);
                 move |_, _| TextureView { texture }
@@ -258,13 +253,9 @@ mod tests {
             cx.update_window(window, |_, window, _| {
                 let surfaces = window.painted_surfaces();
                 assert_eq!(surfaces.len(), 1);
-                assert!(
-                    surfaces[0]
-                        .texture
-                        .downcast_ref::<DummyTexture>()
-                        .is_some()
-                );
-                assert_eq!(surfaces[0].texture_size, size(DevicePixels(64), DevicePixels(64)));
+                let SurfaceSource::Texture { texture, size: dimensions } = &surfaces[0].source else { panic!("expected texture") };
+                assert!(texture.downcast_ref::<DummyTexture>().is_some());
+                assert_eq!(*dimensions, size(DevicePixels(64), DevicePixels(64)));
             })
             .unwrap();
         }

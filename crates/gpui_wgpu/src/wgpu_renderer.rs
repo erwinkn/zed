@@ -13,6 +13,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use wgpu::util::DeviceExt as _;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -82,6 +83,9 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    corner_radii: [f32; 4],
+    opacity: f32,
+    _padding: [f32; 3],
 }
 
 #[repr(C)]
@@ -187,7 +191,6 @@ struct WgpuResources {
     #[allow(dead_code)]
     surface_sampler: wgpu::Sampler,
     #[allow(dead_code)]
-    surface_uniform_buffer: wgpu::Buffer,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -462,13 +465,6 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
-        let surface_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("surface_uniform_buffer"),
-            size: std::mem::size_of::<SurfaceParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -587,7 +583,6 @@ impl WgpuRenderer {
             bind_group_layouts,
             atlas_sampler,
             surface_sampler,
-            surface_uniform_buffer,
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -1059,7 +1054,7 @@ impl WgpuRenderer {
             &layouts.surfaces,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            &[Some(wgpu::ColorTargetState { blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), ..color_target })],
             1,
             &shader_module,
         );
@@ -1271,6 +1266,41 @@ impl WgpuRenderer {
     pub fn gpu_context(&self) -> (Arc<wgpu::Device>, Arc<wgpu::Queue>) {
         let resources = self.resources();
         (resources.device.clone(), resources.queue.clone())
+    }
+
+    pub fn gpu_texture_size(&self, texture: &dyn std::any::Any) -> Result<Size<DevicePixels>> {
+        anyhow::ensure!(
+            !self.device_lost(),
+            "GPU device has been lost; acquire a new context and texture"
+        );
+        let texture = texture
+            .downcast_ref::<wgpu::Texture>()
+            .ok_or_else(|| anyhow::anyhow!("Expected a wgpu::Texture"))?;
+        anyhow::ensure!(
+            texture.dimension() == wgpu::TextureDimension::D2
+                && texture.sample_count() == 1
+                && texture.depth_or_array_layers() == 1,
+            "Texture must be a single-sample 2D texture"
+        );
+        anyhow::ensure!(
+            matches!(
+                texture.format(),
+                wgpu::TextureFormat::Rgba8Unorm
+                    | wgpu::TextureFormat::Bgra8Unorm
+                    | wgpu::TextureFormat::Rgba16Float
+            ),
+            "Texture format must be Rgba8Unorm, Bgra8Unorm, or Rgba16Float"
+        );
+        anyhow::ensure!(
+            texture
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING),
+            "Texture requires TEXTURE_BINDING usage"
+        );
+        Ok(gpui::size(
+            DevicePixels(texture.width().try_into()?),
+            DevicePixels(texture.height().try_into()?),
+        ))
     }
 
     pub fn max_texture_size(&self) -> u32 {
@@ -1555,11 +1585,15 @@ impl WgpuRenderer {
     }
 
     // Ported from gpui-ce #39 / #121: sample an RGBA wgpu texture in the scene.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn draw_surfaces(&self, surfaces: &[gpui::PaintSurface], pass: &mut wgpu::RenderPass<'_>) {
         let resources = self.resources();
         for surface in surfaces {
-            let Some(wgpu_texture) = surface.texture.downcast_ref::<wgpu::Texture>() else {
+            let texture = match &surface.source {
+                gpui::SurfaceSource::Texture { texture, .. } => texture,
+                #[cfg(target_os = "macos")]
+                gpui::SurfaceSource::Surface(_) => continue,
+            };
+            let Some(wgpu_texture) = texture.downcast_ref::<wgpu::Texture>() else {
                 continue;
             };
 
@@ -1568,13 +1602,18 @@ impl WgpuRenderer {
             let params = SurfaceParams {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                corner_radii: [surface.corner_radii.top_left.0, surface.corner_radii.top_right.0, surface.corner_radii.bottom_right.0, surface.corner_radii.bottom_left.0],
+                opacity: surface.opacity,
+                _padding: [0.; 3],
             };
 
-            resources.queue.write_buffer(
-                &resources.surface_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&params),
-            );
+            // Each draw retains its own parameters until GPU execution. Reusing
+            // one queue-written uniform would give all draws the final bounds.
+            let uniform = resources.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("surface_params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
             let bind_group = resources
                 .device
@@ -1584,7 +1623,7 @@ impl WgpuRenderer {
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: resources.surface_uniform_buffer.as_entire_binding(),
+                            resource: uniform.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
@@ -1603,9 +1642,6 @@ impl WgpuRenderer {
             pass.draw(0..4, 0..1);
         }
     }
-
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    fn draw_surfaces(&self, _surfaces: &[gpui::PaintSurface], _pass: &mut wgpu::RenderPass<'_>) {}
 
     fn write_instances(
         &mut self,
@@ -2299,9 +2335,9 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 64 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 50 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);

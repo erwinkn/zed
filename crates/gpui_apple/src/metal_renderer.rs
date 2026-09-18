@@ -126,6 +126,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    rgba_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -330,6 +331,16 @@ impl MetalRenderer {
             false,
         );
 
+        let rgba_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "rgba_surfaces",
+            "surface_vertex",
+            "rgba_surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+            true,
+        );
+
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
@@ -351,6 +362,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            rgba_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1118,6 +1130,42 @@ impl MetalRenderer {
         );
     }
 
+    /// Return the same device and queue used for scene composition.
+    pub fn gpu_context(&self) -> (metal::Device, metal::CommandQueue) {
+        (self.device.clone(), self.command_queue.clone())
+    }
+
+    pub fn gpu_texture_size(&self, texture: &dyn std::any::Any) -> Result<Size<DevicePixels>> {
+        let texture = texture
+            .downcast_ref::<metal::Texture>()
+            .ok_or_else(|| anyhow::anyhow!("Expected a metal::Texture"))?;
+        anyhow::ensure!(
+            texture.device().as_ptr() == self.device.as_ptr(),
+            "Texture must use the window GPU device"
+        );
+        anyhow::ensure!(
+            texture.texture_type() == metal::MTLTextureType::D2 && texture.sample_count() == 1,
+            "Texture must be a single-sample 2D texture"
+        );
+        anyhow::ensure!(
+            matches!(
+                texture.pixel_format(),
+                MTLPixelFormat::RGBA8Unorm
+                    | MTLPixelFormat::BGRA8Unorm
+                    | MTLPixelFormat::RGBA16Float
+            ),
+            "Texture format must be RGBA8Unorm, BGRA8Unorm, or RGBA16Float"
+        );
+        anyhow::ensure!(
+            texture.usage().contains(metal::MTLTextureUsage::ShaderRead),
+            "Texture requires ShaderRead usage"
+        );
+        Ok(size(
+            DevicePixels(texture.width().try_into()?),
+            DevicePixels(texture.height().try_into()?),
+        ))
+    }
+
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
@@ -1147,45 +1195,54 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
-        for (index, surface) in surfaces.iter().enumerate() {
-            let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
-            );
+        command_encoder.set_fragment_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_bindings.surfaces.buffer),
+            instance_bindings.surfaces.offset as u64,
+        );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
+        for (index, surface) in surfaces.iter().enumerate() {
+            match &surface.source {
+                gpui::SurfaceSource::Texture { texture, .. } => {
+                    // paint_gpu_texture validated the resource before recording the scene.
+                    let texture = texture
+                        .downcast_ref::<metal::Texture>()
+                        .expect("validated Metal texture");
+                    command_encoder.set_render_pipeline_state(&self.rgba_surfaces_pipeline_state);
+                    command_encoder
+                        .set_fragment_texture(SurfaceInputIndex::YTexture as u64, Some(texture));
+                }
+                gpui::SurfaceSource::Surface(image_buffer) => {
+                    command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+
+                    assert_eq!(
+                        image_buffer.get_pixel_format(),
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                    );
 
             let y_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
+                    image_buffer.get_width_of_plane(0),
+                    image_buffer.get_height_of_plane(0),
                     0,
                 )
                 .unwrap();
             let cb_cr_texture = self
                 .core_video_texture_cache
                 .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
+                    image_buffer.as_concrete_TypeRef(),
                     None,
                     MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
+                    image_buffer.get_width_of_plane(1),
+                    image_buffer.get_height_of_plane(1),
                     1,
                 )
                 .unwrap();
 
-            command_encoder.set_vertex_bytes(
-                SurfaceInputIndex::TextureSize as u64,
-                mem::size_of_val(&texture_size) as u64,
-                &texture_size as *const Size<DevicePixels> as *const _,
-            );
             // let y_texture = y_texture.get_texture().unwrap().
             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
                 let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
@@ -1195,6 +1252,8 @@ impl MetalRenderer {
                 let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
             });
+                }
+            }
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
@@ -1406,6 +1465,8 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            corner_radii: surface.corner_radii,
+            opacity: surface.opacity,
         }))?,
     })
 }
@@ -1576,7 +1637,6 @@ enum SurfaceInputIndex {
     Vertices = 0,
     Surfaces = 1,
     ViewportSize = 2,
-    TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
 }
@@ -1593,11 +1653,13 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: gpui::Corners<ScaledPixels>,
+    pub opacity: f32,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1616,6 +1678,14 @@ impl MetalHeadlessRenderer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
+    fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.renderer.gpu_context()))
+    }
+
+    fn gpu_texture_size(&self, texture: &dyn std::any::Any) -> Result<Size<DevicePixels>> {
+        self.renderer.gpu_texture_size(texture)
+    }
+
     fn render_scene_to_image(
         &mut self,
         scene: &Scene,
@@ -1630,5 +1700,170 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod texture_composition_tests {
+    use super::*;
+    use gpui::{Corners, Quad, SurfaceSource};
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(w), ScaledPixels(h)),
+        )
+    }
+
+    fn produce(
+        renderer: &MetalRenderer,
+        width: u64,
+        color: metal::MTLClearColor,
+    ) -> metal::Texture {
+        let (device, queue) = renderer.gpu_context();
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width);
+        descriptor.set_height(width);
+        descriptor.set_pixel_format(MTLPixelFormat::RGBA16Float);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&descriptor);
+        let pass = metal::RenderPassDescriptor::new();
+        let attachment = pass.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(&texture));
+        attachment.set_load_action(metal::MTLLoadAction::Clear);
+        attachment.set_store_action(metal::MTLStoreAction::Store);
+        attachment.set_clear_color(color);
+        let commands = queue.new_command_buffer();
+        commands.new_render_command_encoder(pass).end_encoding();
+        commands.commit(); // No CPU wait. The scene uses the same queue.
+        texture
+    }
+
+    fn scene_with_blue_background() -> Scene {
+        let mut scene = Scene::default();
+        let bounds = bounds(0., 0., 32., 32.);
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: gpui::rgb(0x0000ff).into(),
+            ..Default::default()
+        });
+        scene
+    }
+
+    fn surface(texture: metal::Texture, opacity: f32) -> PaintSurface {
+        PaintSurface {
+            order: 0,
+            bounds: bounds(0., 0., 32., 32.),
+            content_mask: ContentMask {
+                bounds: bounds(0., 0., 32., 32.),
+            },
+            corner_radii: Corners::default(),
+            opacity,
+            source: SurfaceSource::Texture {
+                size: size(
+                    DevicePixels(texture.width() as i32),
+                    DevicePixels(texture.height() as i32),
+                ),
+                texture: Arc::new(texture),
+            },
+        }
+    }
+
+    fn pixel_is(image: &RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
+        let actual = image.get_pixel(x, y).0;
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "pixel ({x}, {y}): {:?}, expected {expected}",
+                image.get_pixel(x, y).0
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_texture_preserves_premultiplied_alpha_and_hdr_before_blending() {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        for (red, alpha, opacity, expected) in [
+            (0.5, 0.5, 1.0, [128, 0, 128, 255]),
+            (2.0, 0.25, 0.25, [128, 0, 239, 255]),
+            (0.0, 0.0, 1.0, [0, 0, 255, 255]),
+        ] {
+            let texture = produce(&renderer, 4, metal::MTLClearColor::new(red, 0., 0., alpha));
+            assert_eq!(
+                renderer.gpu_texture_size(&texture).unwrap(),
+                size(DevicePixels(4), DevicePixels(4))
+            );
+            let mut scene = scene_with_blue_background();
+            scene.insert_primitive(surface(texture, opacity));
+            scene.finish();
+            let image = renderer
+                .render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32)))
+                .unwrap();
+            pixel_is(&image, 16, 16, expected);
+        }
+        assert!(renderer.gpu_texture_size(&42usize).is_err());
+    }
+
+    #[test]
+    fn ordinary_translucent_quads_and_gradients_keep_premultiplied_blending() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let red = gpui::rgba(0xff000080);
+        for (index, background) in [
+            red.into(),
+            gpui::linear_gradient(90., gpui::linear_color_stop(red, 0.), gpui::linear_color_stop(red, 1.)),
+        ].into_iter().enumerate() {
+            let mut scene = scene_with_blue_background();
+            let bounds = bounds(0., 0., 32., 32.);
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: ContentMask { bounds },
+                background,
+                ..Default::default()
+            });
+            scene.finish();
+            let image = renderer.render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32))).unwrap();
+            // Gradient dithering adds at most 2 RGB steps and 3 alpha steps.
+            // Allow those plus one rounding step; solid fills have no dither.
+            let tolerance = if index == 0 { 1 } else { 6 };
+            for (actual, expected) in image.get_pixel(16, 16).0.into_iter().zip([128, 0, 127, 255]) {
+                assert!(actual.abs_diff(expected) <= tolerance, "background {index}: {actual}, expected {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_texture_obeys_clip_corners_resize_and_later_scene_content() {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        for texture_width in [4, 12] {
+            let texture = produce(
+                &renderer,
+                texture_width,
+                metal::MTLClearColor::new(1., 0., 0., 1.),
+            );
+            let mut paint = surface(texture, 1.);
+            paint.corner_radii = Corners::all(ScaledPixels(8.));
+            paint.content_mask.bounds = bounds(0., 0., 24., 32.);
+            let mut scene = scene_with_blue_background();
+            scene.insert_primitive(paint);
+            let cover = bounds(12., 12., 8., 8.);
+            scene.insert_primitive(Quad {
+                bounds: cover,
+                content_mask: ContentMask { bounds: cover },
+                background: gpui::rgb(0x00ff00).into(),
+                ..Default::default()
+            });
+            scene.finish();
+            let image = renderer
+                .render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32)))
+                .unwrap();
+            pixel_is(&image, 0, 0, [0, 0, 255, 255]);
+            pixel_is(&image, 8, 16, [255, 0, 0, 255]);
+            pixel_is(&image, 28, 16, [0, 0, 255, 255]);
+            pixel_is(&image, 16, 16, [0, 255, 0, 255]);
+        }
     }
 }

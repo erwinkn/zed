@@ -2097,6 +2097,13 @@ impl PlatformWindow for WaylandWindow {
         state.client.update_ime_position(bounds);
     }
 
+    fn gpu_texture_size(
+        &self,
+        texture: &dyn std::any::Any,
+    ) -> anyhow::Result<gpui::Size<gpui::DevicePixels>> {
+        self.borrow().renderer.gpu_texture_size(texture)
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.borrow().renderer.gpu_specs().into()
     }

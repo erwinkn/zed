@@ -841,6 +841,21 @@ impl PlatformWindow for WebWindow {
             .supports_dual_source_blending()
     }
 
+    fn gpu_texture_size(
+        &self,
+        texture: &dyn std::any::Any,
+    ) -> anyhow::Result<gpui::Size<gpui::DevicePixels>> {
+        self.inner.state.borrow().renderer.gpu_texture_size(texture)
+    }
+
+    fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.inner.state.borrow().renderer.gpu_context()))
+    }
+
+    fn gpu_device_lost(&self) -> Option<bool> {
+        Some(self.inner.state.borrow().renderer.device_lost())
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         Some(self.inner.state.borrow().renderer.gpu_specs())
     }

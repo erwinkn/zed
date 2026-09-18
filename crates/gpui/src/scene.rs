@@ -763,35 +763,22 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
-#[derive(Clone)]
+/// A shared GPU resource. Browser handles stay on their owning thread.
+#[cfg(not(target_family = "wasm"))]
+pub type GpuTextureHandle = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+/// A shared GPU resource. Browser handles stay on their owning thread.
+#[cfg(target_family = "wasm")]
+pub type GpuTextureHandle = std::sync::Arc<dyn std::any::Any>;
+
+#[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
-    /// Type-erased GPU texture (`Arc<wgpu::Texture>`). Ported from gpui-ce
-    /// ([#39](https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477)).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    pub texture: std::sync::Arc<dyn std::any::Any + Send + Sync>,
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    pub texture_size: Size<crate::DevicePixels>,
-}
-
-impl std::fmt::Debug for PaintSurface {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut debug = f.debug_struct("PaintSurface");
-        debug
-            .field("order", &self.order)
-            .field("bounds", &self.bounds)
-            .field("content_mask", &self.content_mask);
-        #[cfg(target_os = "macos")]
-        debug.field("image_buffer", &self.image_buffer);
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        debug.field("texture_size", &self.texture_size);
-        debug.finish_non_exhaustive()
-    }
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
+    pub source: crate::SurfaceSource,
 }
 
 impl From<PaintSurface> for Primitive {

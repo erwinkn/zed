@@ -452,6 +452,19 @@ impl PlatformWindow for TestWindow {
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
 
+    fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        self.0.lock().renderer.as_ref()?.gpu_context()
+    }
+
+    fn gpu_texture_size(&self, texture: &dyn std::any::Any) -> anyhow::Result<Size<DevicePixels>> {
+        let state = self.0.lock();
+        let renderer = state
+            .renderer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Test window has no GPU renderer"))?;
+        renderer.gpu_texture_size(texture)
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
     }
