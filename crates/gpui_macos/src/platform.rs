@@ -59,7 +59,7 @@ use std::{
     slice, str,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     },
 };
 
@@ -70,6 +70,8 @@ const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
 static REGISTERED_MAC_PLATFORM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static APP_HAS_LAUNCHED: AtomicBool = AtomicBool::new(false);
+static NEXT_PLATFORM_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[ctor(unsafe)]
 unsafe fn build_classes() {
@@ -99,6 +101,10 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(applicationWillTerminate:),
                 will_terminate as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
             );
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
@@ -189,6 +195,8 @@ pub(crate) struct MacPlatformState {
     renderer_context: renderer::Context,
     headless: bool,
     mode: MacPlatformMode,
+    owns_event_loop: bool,
+    generation: u64,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
     reopen: Option<Box<dyn FnMut()>>,
@@ -234,6 +242,8 @@ impl MacPlatform {
         Self(Mutex::new(MacPlatformState {
             headless,
             mode: MacPlatformMode::Blocking,
+            owns_event_loop: false,
+            generation: NEXT_PLATFORM_GENERATION.fetch_add(1, Ordering::Relaxed),
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
@@ -269,6 +279,29 @@ impl MacPlatform {
         let platform = Self::new(false);
         platform.0.lock().mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Ready);
         platform
+    }
+
+    /// Enter AppKit's blocking loop after embedded initialization. The caller
+    /// must keep all application work on another runtime until this returns.
+    pub fn run_event_loop(&self) {
+        assert_main_thread("MacPlatform::run_event_loop");
+        {
+            let mut state = self.0.lock();
+            assert!(matches!(
+                state.mode,
+                MacPlatformMode::Embedded(EmbeddedLifecycle::Launched)
+            ));
+            state.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Running);
+            state.owns_event_loop = true;
+        }
+        unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            app.run();
+            pool.drain();
+        }
+        self.0.lock().owns_event_loop = false;
+        self.finish_embedded_run();
     }
 
     /// Processes pending AppKit work without waiting for new events.
@@ -328,6 +361,15 @@ impl MacPlatform {
                 );
                 app.postEvent_atStart_(event, NO);
             }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn request_test_termination(&self) {
+        assert_main_thread("MacPlatform::request_test_termination");
+        unsafe {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            let _: () = msg_send![app, terminate: nil];
         }
     }
 
@@ -769,6 +811,21 @@ impl Platform for MacPlatform {
 
             self.register_with_appkit(app, app_delegate);
 
+            // AppKit sends didFinishLaunching only once per process. A later
+            // embedded application still needs its own setup and subscriptions.
+            if embedded && APP_HAS_LAUNCHED.load(Ordering::Acquire) {
+                extern "C" fn finish_again(delegate: *mut c_void) {
+                    unsafe {
+                        did_finish_launching(
+                            &mut *(delegate as *mut Object),
+                            sel!(applicationDidFinishLaunching:),
+                            nil,
+                        );
+                    }
+                }
+                DispatchQueue::main().exec_async_f(app_delegate as *mut c_void, finish_again);
+            }
+
             let pool = NSAutoreleasePool::new(nil);
             app.run();
             pool.drain();
@@ -789,12 +846,71 @@ impl Platform for MacPlatform {
         // this, we make quitting the application asynchronous so that we aren't holding borrows to
         // the app state on the stack when we actually terminate the app.
 
+        struct QuitRequest {
+            platform: *const MacPlatform,
+            generation: u64,
+            embedded: bool,
+        }
+        let request = {
+            let state = self.0.lock();
+            Box::new(QuitRequest {
+                platform: self,
+                generation: state.generation,
+                embedded: matches!(state.mode, MacPlatformMode::Embedded(_)),
+            })
+        };
         unsafe {
-            DispatchQueue::main().exec_async_f(ptr::null_mut(), quit);
+            DispatchQueue::main().exec_async_f(Box::into_raw(request).cast(), quit);
         }
 
-        extern "C" fn quit(_: *mut c_void) {
+        extern "C" fn quit(request: *mut c_void) {
             unsafe {
+                let request = Box::from_raw(request.cast::<QuitRequest>());
+                if !request.embedded {
+                    // Preserve blocking and headless platform termination.
+                    let app = NSApplication::sharedApplication(nil);
+                    let _: () = msg_send![app, terminate: nil];
+                    return;
+                }
+                let registered = REGISTERED_MAC_PLATFORM
+                    .load(Ordering::Acquire)
+                    .cast::<MacPlatform>();
+                // A queued quit can outlive an embedded application. Never send
+                // it to the next application, even if its allocation is reused.
+                if registered != request.platform.cast_mut() {
+                    return;
+                }
+                if let Some(platform) = registered.as_ref() {
+                    let callback = {
+                        let mut state = platform.0.lock();
+                        if state.generation != request.generation
+                            || matches!(
+                                state.mode,
+                                MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated)
+                            )
+                        {
+                            return;
+                        }
+                        if state.owns_event_loop {
+                            Some(state.quit.take())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(callback) = callback {
+                        if let Some(mut callback) = callback {
+                            if !callback() {
+                                platform.0.lock().quit = Some(callback);
+                                platform.quit();
+                                return;
+                            }
+                        }
+                        platform.0.lock().mode =
+                            MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated);
+                        stop_app_immediately();
+                        return;
+                    }
+                }
                 let app = NSApplication::sharedApplication(nil);
                 let _: () = msg_send![app, terminate: nil];
             }
@@ -1556,6 +1672,7 @@ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
 }
 
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
+    APP_HAS_LAUNCHED.store(true, Ordering::Release);
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
         app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
@@ -1642,6 +1759,18 @@ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
         callback();
         platform.0.lock().quit.get_or_insert(callback);
     }
+}
+
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+    if let Some(platform) = unsafe { get_mac_platform(this) } {
+        if platform.0.lock().owns_event_loop {
+            // Return to the launcher so it can stop the application worker and
+            // run its cleanup. NSApplication::terminate would exit the process.
+            platform.quit();
+            return 0; // NSTerminateCancel
+        }
+    }
+    1 // NSTerminateNow
 }
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {

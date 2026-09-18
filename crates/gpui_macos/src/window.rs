@@ -1300,6 +1300,10 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        // GPUI already removed this window. The deferred AppKit close must not
+        // call back into its former App, which an embedder can now have dropped.
+        this.close_callback.take();
+        this.closed.store(true, Ordering::Release);
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -1602,6 +1606,17 @@ impl PlatformWindow for MacWindow {
                 }
             })
             .detach();
+    }
+
+    fn show_inactive(&self) -> anyhow::Result<()> {
+        let state = self.0.lock();
+        if state.closed.load(Ordering::Acquire) {
+            anyhow::bail!("Cannot show a closed window");
+        }
+        unsafe {
+            let _: () = msg_send![state.native_window, orderBack: nil];
+        }
+        Ok(())
     }
 
     fn request_attention(&self) {

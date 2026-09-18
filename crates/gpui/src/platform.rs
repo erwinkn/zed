@@ -845,6 +845,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Show a prepared window without changing keyboard focus.
+    fn show_inactive(&self) -> anyhow::Result<()> {
+        anyhow::bail!("Showing an inactive window is not supported on this platform")
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;

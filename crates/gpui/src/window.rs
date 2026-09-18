@@ -5948,6 +5948,11 @@ impl Window {
         self.platform_window.activate();
     }
 
+    /// Show a prepared window without changing keyboard focus.
+    pub fn show_inactive(&self) -> anyhow::Result<()> {
+        self.platform_window.show_inactive()
+    }
+
     /// Requests that the operating system draw attention to this window.
     pub fn request_attention(&self) {
         self.platform_window.request_attention();
