@@ -959,6 +959,7 @@ pub(crate) struct DeferredDraw {
     parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
+    element_context_stack: SmallVec<[Rc<dyn Any>; 1]>,
     content_mask: Option<ContentMask<Pixels>>,
     rem_size: Pixels,
     element: Option<AnyElement>,
@@ -1162,6 +1163,7 @@ pub struct Window {
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    element_context_stack: SmallVec<[Rc<dyn Any>; 1]>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
@@ -1858,6 +1860,7 @@ impl Window {
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
+            element_context_stack: SmallVec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
@@ -3377,6 +3380,7 @@ impl Window {
 
     fn prepaint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
+        debug_assert!(self.element_context_stack.is_empty());
 
         // Process deferred draws in multiple rounds to support nesting.
         // Each round processes all current deferred draws, which may push new ones.
@@ -3410,6 +3414,8 @@ impl Window {
                         .clone_from(&deferred_draw.element_id_stack);
                     self.text_style_stack
                         .clone_from(&deferred_draw.text_style_stack);
+                    self.element_context_stack
+                        .clone_from(&deferred_draw.element_context_stack);
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
@@ -3441,12 +3447,14 @@ impl Window {
 
             self.element_id_stack.clear();
             self.text_style_stack.clear();
+            self.element_context_stack.clear();
             round_start = round_end;
         }
     }
 
     fn paint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
+        debug_assert!(self.element_context_stack.is_empty());
 
         // Paint all deferred draws in priority order.
         // Since prepaint has already processed nested deferreds, we just paint them all.
@@ -3460,6 +3468,8 @@ impl Window {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
             self.element_id_stack
                 .clone_from(&deferred_draw.element_id_stack);
+            self.element_context_stack
+                .clone_from(&deferred_draw.element_context_stack);
             self.next_frame
                 .dispatch_tree
                 .set_active_node(deferred_draw.parent_node);
@@ -3482,6 +3492,7 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
+        self.element_context_stack.clear();
     }
 
     fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
@@ -3542,6 +3553,7 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
+                    element_context_stack: deferred_draw.element_context_stack.clone(),
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
@@ -3608,6 +3620,35 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+    }
+
+    /// Makes a typed value available while drawing child elements. The nearest
+    /// enclosing value of the same type wins. Use this in each element lifecycle
+    /// phase that needs the value; the scope ends when the callback returns.
+    /// Deferred draws retain the context active when `defer_draw` is called and
+    /// restore it during their prepaint and paint phases, including nested draws.
+    ///
+    /// This does not invalidate view caches or re-run callbacks during cached
+    /// paint replay. Invalidate dependent views when a context value changes.
+    pub fn with_element_context<T: 'static, R>(
+        &mut self,
+        value: Rc<T>,
+        draw: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.element_context_stack.push(value);
+        let result = draw(self);
+        self.element_context_stack.pop();
+        result
+    }
+
+    /// Returns the nearest drawing context of this type, or None outside its
+    /// scope. The value is window-local and is not installed for input callbacks.
+    pub fn element_context<T: 'static>(&self) -> Option<&T> {
+        self.element_context_stack
+            .iter()
+            .rev()
+            .find_map(|value| value.downcast_ref())
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4048,6 +4089,7 @@ impl Window {
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
+            element_context_stack: self.element_context_stack.clone(),
             content_mask,
             rem_size: self.rem_size(),
             priority,

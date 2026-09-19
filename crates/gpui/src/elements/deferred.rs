@@ -203,4 +203,164 @@ mod tests {
             })
             .unwrap();
     }
+
+    struct ContextView;
+    impl Render for ContextView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                crate::canvas(
+                    |_, window, cx| {
+                        assert!(window.element_context::<usize>().is_none());
+                        window.with_element_context(std::rc::Rc::new("label"), |window| {
+                            window.with_element_context(std::rc::Rc::new(11usize), |window| {
+                                let child = crate::canvas(
+                                    |_, window, cx| {
+                                        assert_eq!(window.element_context::<usize>(), Some(&11));
+                                        window.with_element_context(
+                                            std::rc::Rc::new(22usize),
+                                            |window| {
+                                                defer_context_probe(window, cx, 22, 2);
+                                            },
+                                        );
+                                        assert_eq!(window.element_context::<usize>(), Some(&11));
+                                    },
+                                    |_, _, window, cx| {
+                                        assert_eq!(window.element_context::<usize>(), Some(&11));
+                                        assert_eq!(
+                                            window.element_context::<&str>(),
+                                            Some(&"label")
+                                        );
+                                        cx.global_mut::<ContextLog>().0.push(11);
+                                    },
+                                )
+                                .size_full();
+                                let mut child = child.into_any_element();
+                                child.layout_as_root(
+                                    size(
+                                        crate::AvailableSpace::Definite(px(20.)),
+                                        crate::AvailableSpace::Definite(px(20.)),
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                                window.defer_draw(child, point(px(0.), px(0.)), 0, None);
+                            });
+                            assert!(window.element_context::<usize>().is_none());
+                            assert_eq!(window.element_context::<&str>(), Some(&"label"));
+                        });
+                        assert!(window.element_context::<&str>().is_none());
+                        let mut sibling = crate::canvas(
+                            |_, window, _| {
+                                assert!(window.element_context::<usize>().is_none());
+                                assert!(window.element_context::<&str>().is_none());
+                            },
+                            |_, _, window, cx| {
+                                assert!(window.element_context::<usize>().is_none());
+                                assert!(window.element_context::<&str>().is_none());
+                                cx.global_mut::<ContextLog>().0.push(0);
+                            },
+                        )
+                        .size_full()
+                        .into_any_element();
+                        sibling.layout_as_root(
+                            size(
+                                crate::AvailableSpace::Definite(px(20.)),
+                                crate::AvailableSpace::Definite(px(20.)),
+                            ),
+                            window,
+                            cx,
+                        );
+                        window.defer_draw(sibling, point(px(30.), px(0.)), 1, None);
+                    },
+                    |_, _, window, _| assert!(window.element_context::<usize>().is_none()),
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    fn defer_context_probe(
+        window: &mut Window,
+        cx: &mut crate::App,
+        expected: usize,
+        priority: usize,
+    ) {
+        let mut child = crate::canvas(
+            move |_, window, _| {
+                assert_eq!(window.element_context::<usize>(), Some(&expected));
+                assert_eq!(window.element_context::<&str>(), Some(&"label"));
+            },
+            move |_, _, window, cx| {
+                assert_eq!(window.element_context::<usize>(), Some(&expected));
+                assert_eq!(window.element_context::<&str>(), Some(&"label"));
+                cx.global_mut::<ContextLog>().0.push(expected);
+            },
+        )
+        .size_full()
+        .into_any_element();
+        child.layout_as_root(
+            size(
+                crate::AvailableSpace::Definite(px(20.)),
+                crate::AvailableSpace::Definite(px(20.)),
+            ),
+            window,
+            cx,
+        );
+        window.defer_draw(child, point(px(0.), px(0.)), priority, None);
+    }
+
+    #[derive(Default)]
+    struct ContextLog(Vec<usize>);
+    impl crate::Global for ContextLog {}
+
+    #[gpui::test]
+    fn test_element_context_survives_nested_deferred_draws(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(ContextLog::default()));
+        let handle = cx.add_window(|_, _| ContextView);
+        for _ in 0..2 {
+            cx.update_window(handle.into(), |_, window, cx| {
+                cx.global_mut::<ContextLog>().0.clear();
+                window.draw(cx).clear(cx);
+                assert_eq!(cx.global::<ContextLog>().0, vec![11, 0, 22]);
+                assert!(window.element_context::<usize>().is_none());
+                assert!(window.element_context::<&str>().is_none());
+            })
+            .unwrap();
+        }
+    }
+
+    struct CachedContextRoot(Entity<ContextView>);
+    impl Render for CachedContextRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+        }
+    }
+
+    #[gpui::test]
+    fn test_cached_deferred_context_does_not_leak_or_repeat_paint(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(ContextLog::default()));
+        let handle = cx.add_window(|_, cx| CachedContextRoot(cx.new(|_| ContextView)));
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.update(|cx| cx.global_mut::<ContextLog>().0.clear());
+            handle.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+            handle
+                .update(cx, |_, window, cx| {
+                    assert!(cx.global::<ContextLog>().0.is_empty());
+                    assert_eq!(window.rendered_frame.deferred_draws.len(), 3);
+                    assert!(window.element_context::<usize>().is_none());
+                })
+                .unwrap();
+        }
+        handle
+            .update(cx, |root, _, cx| {
+                root.0.update(cx, |_, cx| cx.notify());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(cx.global::<ContextLog>().0, vec![11, 0, 22]));
+    }
 }

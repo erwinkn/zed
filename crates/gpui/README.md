@@ -118,3 +118,20 @@ to stop window-dependent work or release component resources that need those
 contexts. It cannot cancel closing. Use `on_window_should_close` for that.
 Register before closing starts, and use the supplied window directly inside
 the callback. `App::on_window_closed` still runs after a window is inaccessible.
+
+
+### Element drawing context
+
+`Window::with_element_context(Rc<T>, callback)` makes a typed value available
+while the callback draws child elements. `Window::element_context::<T>()` reads
+the nearest enclosing value of that type. Scope the lifecycle phases that need
+the value. Each scope ends when its callback returns. The context belongs to the
+window and is absent from ordinary input callbacks.
+
+A deferred draw retains the contexts active at `defer_draw` and restores them
+for its later prepaint and paint, including nested deferred draws. Use this for
+metadata that must follow an element through a delayed paint. Contexts can stay
+alive in retained deferred draw records until GPUI discards those records.
+They do not invalidate cached views. Cached paint replay does not call element
+callbacks again. The caller must invalidate views when a context change affects
+cached content.
