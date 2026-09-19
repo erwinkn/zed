@@ -108,3 +108,13 @@ Use them when appending or replacing rows whose heights are not yet measured.
 `with_uniform_item_height` fills missing hints and preserves measured entries.
 It traverses the index, so it is intended for initialization. Use a hinted splice
 for incremental updates. Actual layout measurements replace the hints.
+
+### Window cleanup
+
+`Window::on_close` registers a callback that runs once before native window
+resources are destroyed. It receives the live `Window` and `App`. It covers
+programmatic `remove_window`, platform close, and application shutdown. Use it
+to stop window-dependent work or release component resources that need those
+contexts. It cannot cancel closing. Use `on_window_should_close` for that.
+Register before closing starts, and use the supplied window directly inside
+the callback. `App::on_window_closed` still runs after a window is inaccessible.

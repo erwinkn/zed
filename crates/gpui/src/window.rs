@@ -1136,11 +1136,14 @@ enum InputModality {
     Touch,
 }
 
+type WindowCloseCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
+    close_callbacks: Option<Vec<WindowCloseCallback>>,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     display_id: Option<DisplayId>,
     is_resizable: bool,
@@ -1840,6 +1843,7 @@ impl Window {
             handle,
             invalidator,
             removed: false,
+            close_callbacks: Some(Vec::new()),
             platform_window,
             display_id,
             is_resizable,
@@ -2039,6 +2043,25 @@ impl Window {
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
+    }
+
+    /// Run cleanup once before this window is destroyed, while its root and
+    /// native resources are still available. Covers both `remove_window` and
+    /// application shutdown. The callback cannot cancel closing. Register it
+    /// before closing starts; callbacks added during cleanup are not invoked.
+    /// Use the supplied window directly, not a nested update of its handle.
+    pub fn on_close(&mut self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        if let Some(callbacks) = &mut self.close_callbacks {
+            callbacks.push(Box::new(callback));
+        }
+    }
+
+    pub(crate) fn run_close_callbacks(&mut self, cx: &mut App) {
+        if let Some(callbacks) = self.close_callbacks.take() {
+            for callback in callbacks {
+                callback(self, cx);
+            }
+        }
     }
 
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
@@ -7229,6 +7252,57 @@ mod tests {
     };
 
     struct EmptyView;
+
+    #[gpui::test]
+    fn test_window_close_callback_keeps_root_and_window_available(cx: &mut TestAppContext) {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window(|_, _| EmptyView);
+        let closed = order.clone();
+        let _subscription =
+            cx.update(|cx| cx.on_window_closed(move |_, _| closed.borrow_mut().push("closed")));
+        let closing = order.clone();
+        window
+            .update(cx, |_, window, _| {
+                window.on_close(move |window, cx| {
+                    // The root is no longer borrowed by the update that removed it.
+                    let root = window.root::<EmptyView>().unwrap().unwrap();
+                    root.update(cx, |_, cx| cx.notify());
+                    assert!(window.viewport_size().width > px(0.));
+                    closing.borrow_mut().push("cleanup");
+                    window.on_close(|_, _| panic!("late registration must not run"));
+                    window.remove_window();
+                });
+                window.remove_window();
+            })
+            .unwrap();
+        assert_eq!(*order.borrow(), ["cleanup", "closed"]);
+        assert!(window.update(cx, |_, _, _| ()).is_err());
+        cx.update(|cx| cx.shutdown());
+        assert_eq!(*order.borrow(), ["cleanup", "closed"]);
+    }
+
+    #[gpui::test]
+    fn test_window_close_callbacks_run_once_on_app_shutdown(cx: &mut TestAppContext) {
+        let count = Rc::new(Cell::new(0));
+        for _ in 0..2 {
+            let window = cx.add_window(|_, _| EmptyView);
+            let count = count.clone();
+            window
+                .update(cx, |_, window, _| {
+                    window.on_close(move |window, cx| {
+                        let root = window.root::<EmptyView>().unwrap().unwrap();
+                        root.update(cx, |_, cx| cx.notify());
+                        count.set(count.get() + 1);
+                        window.remove_window();
+                    });
+                })
+                .unwrap();
+        }
+        cx.update(|cx| cx.shutdown());
+        assert_eq!(count.get(), 2);
+        cx.update(|cx| cx.shutdown());
+        assert_eq!(count.get(), 2);
+    }
 
     impl Render for EmptyView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {

@@ -984,6 +984,10 @@ impl App {
             futures.push(observer(self));
         }
 
+        for handle in self.windows() {
+            // An earlier callback can already have closed another window.
+            let _ = self.update_window(handle, |_, window, cx| window.run_close_callbacks(cx));
+        }
         self.windows.clear();
         self.window_handles.clear();
         self.flush_effects();
@@ -1888,7 +1892,10 @@ impl App {
 
             cx.window_update_stack.push(window.handle.id);
             let result = update(root_view, &mut window, cx);
-            fn trail(id: WindowId, window: Box<Window>, cx: &mut App) -> Option<()> {
+            fn trail(id: WindowId, mut window: Box<Window>, cx: &mut App) -> Option<()> {
+                if window.removed {
+                    window.run_close_callbacks(cx);
+                }
                 cx.window_update_stack.pop();
 
                 if window.removed {
