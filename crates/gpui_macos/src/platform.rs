@@ -15,7 +15,7 @@ use cocoa::{
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSRect, NSString,
+        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSString,
         NSUInteger, NSURL,
     },
 };
@@ -351,7 +351,7 @@ impl MacPlatform {
             let window: id = msg_send![windows, objectAtIndex: 0usize];
             let number: NSInteger = msg_send![window, windowNumber];
             let view: id = msg_send![window, contentView];
-            let bounds: NSRect = msg_send![view, bounds];
+            let bounds: cocoa::foundation::NSRect = msg_send![view, bounds];
             for index in 0..count {
                 let event = <id as NSEvent>::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
                     nil, NSEventType::NSMouseMoved,

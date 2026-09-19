@@ -20,6 +20,7 @@ use futures::{
     future::{LocalBoxFuture, Shared},
 };
 use itertools::Itertools;
+#[cfg(any(test, feature = "leak-detection"))]
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
@@ -644,6 +645,11 @@ impl SystemWindowTabController {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FOCUS_CLEANUP_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) enum GpuiMode {
     #[cfg(any(test, feature = "test-support"))]
     Test {
@@ -831,7 +837,7 @@ impl App {
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::new(FocusMap::default()),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -1772,10 +1778,15 @@ impl App {
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
     fn release_dropped_focus_handles(&mut self) {
+        if !self.focus_handles.take_dropped() {
+            return;
+        }
         self.focus_handles
             .clone()
             .write()
             .retain(|handle_id, focus| {
+                #[cfg(test)]
+                FOCUS_CLEANUP_VISITS.with(|visits| visits.set(visits.get() + 1));
                 if focus.ref_count.load(SeqCst) == 0 {
                     for window_handle in self.windows() {
                         window_handle
@@ -3126,6 +3137,52 @@ mod test {
     use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
 
     struct RenderCounter(Rc<Cell<usize>>);
+
+    #[gpui::test]
+    fn focus_cleanup_does_not_scan_live_handles_per_effect(cx: &mut TestAppContext) {
+        let handles = cx.update(|cx| (0..128).map(|_| cx.focus_handle()).collect::<Vec<_>>());
+        super::FOCUS_CLEANUP_VISITS.with(|visits| visits.set(0));
+        cx.update(|cx| {
+            for _ in 0..128 {
+                cx.defer(|_| {});
+            }
+            drop(handles[0].clone());
+        });
+        assert_eq!(
+            super::FOCUS_CLEANUP_VISITS.with(|visits| visits.get()),
+            0,
+            "live focus handles must not be rescanned after every queued effect"
+        );
+        drop(handles);
+        cx.update(|_| {});
+    }
+
+    #[gpui::test]
+    fn focus_cleanup_releases_last_handle_and_blurs_the_window(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let handle = cx.update(|cx| cx.focus_handle());
+        let id = handle.id();
+        let weak = handle.downgrade();
+        let survivor = handle.clone();
+        window
+            .update(cx, |_, window, cx| window.focus(&handle, cx))
+            .unwrap();
+        drop(handle);
+        cx.update(|_| {});
+        assert!(weak.upgrade().is_some());
+        window
+            .update(cx, |_, window, _| assert_eq!(window.focus, Some(id)))
+            .unwrap();
+        std::thread::spawn(move || drop(survivor)).join().unwrap();
+        assert!(weak.upgrade().is_none());
+        cx.update(|_| {});
+        window
+            .update(cx, |_, window, cx| {
+                assert_eq!(window.focus, None);
+                assert!(!cx.focus_handles.read().contains_key(id));
+            })
+            .unwrap();
+    }
 
     impl Render for RenderCounter {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {

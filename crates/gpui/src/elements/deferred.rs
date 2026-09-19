@@ -368,7 +368,7 @@ mod tests {
         div()
             .w(px(10.))
             .h(px(10.))
-            .debug_selector(move || format!("complete-{index}").into())
+            .debug_selector(move || format!("complete-{index}"))
             .on_painted(move |_, window, cx| {
                 cx.global_mut::<ContextLog>().0.push(index);
                 window.on_draw_complete(move |window, cx| {

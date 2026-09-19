@@ -485,7 +485,26 @@ impl ArenaClearNeeded {
     }
 }
 
-pub(crate) type FocusMap = RwLock<SlotMap<FocusId, FocusRef>>;
+#[derive(Default)]
+pub(crate) struct FocusMap {
+    handles: RwLock<SlotMap<FocusId, FocusRef>>,
+    dropped: AtomicBool,
+}
+
+impl FocusMap {
+    pub(crate) fn take_dropped(&self) -> bool {
+        self.dropped.swap(false, SeqCst)
+    }
+}
+
+impl std::ops::Deref for FocusMap {
+    type Target = RwLock<SlotMap<FocusId, FocusRef>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handles
+    }
+}
+
 pub(crate) struct FocusRef {
     pub(crate) ref_count: AtomicUsize,
     pub(crate) tab_index: isize,
@@ -656,12 +675,12 @@ impl Eq for FocusHandle {}
 
 impl Drop for FocusHandle {
     fn drop(&mut self) {
-        self.handles
-            .read()
-            .get(self.id)
-            .unwrap()
-            .ref_count
-            .fetch_sub(1, SeqCst);
+        let handles = self.handles.read();
+        if handles.get(self.id).unwrap().ref_count.fetch_sub(1, SeqCst) == 1 {
+            // Signal before releasing the read lock, so a concurrent cleanup
+            // cannot remove the record before its final drop is recorded.
+            self.handles.dropped.store(true, SeqCst);
+        }
     }
 }
 

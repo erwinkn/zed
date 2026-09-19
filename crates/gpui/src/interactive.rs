@@ -877,9 +877,8 @@ mod test {
             canvas(
                 |_, _, _| (),
                 move |_, _, window, _| {
-                    window.on_root_key_event({
-                        let phases = phases.clone();
-                        move |_: &KeyDownEvent, phase, _, _| phases.borrow_mut().push(phase)
+                    window.on_root_key_event(move |_: &KeyDownEvent, phase, _, _| {
+                        phases.borrow_mut().push(phase)
                     });
                 },
             )
