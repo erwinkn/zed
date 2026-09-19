@@ -35,6 +35,11 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// Nodes given a measure closure this frame. `TaffyTree::clear` drops
+    /// nodes but not their contexts, which would otherwise keep every
+    /// measured element's closure and its captured text layout alive until
+    /// the next frame overwrote the slot.
+    measured_nodes: Vec<NodeId>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -49,10 +54,14 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            measured_nodes: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
+        for node in self.measured_nodes.drain(..) {
+            self.taffy.set_node_context(node, None).ok();
+        }
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
@@ -100,10 +109,12 @@ impl TaffyLayoutEngine {
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
-        self.taffy
+        let node = self
+            .taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+            .expect(EXPECT_MESSAGE);
+        self.measured_nodes.push(node);
+        node.into()
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -112,6 +123,11 @@ impl TaffyLayoutEngine {
     /// root element on the web, which stretches to fill the initial containing
     /// block (the viewport) unless given an explicit size. Explicitly styled
     /// dimensions are preserved.
+    #[cfg(test)]
+    pub(crate) fn measured_node_count(&self) -> usize {
+        self.measured_nodes.len()
+    }
+
     pub fn stretch_auto_size_to_fill(
         &mut self,
         id: LayoutId,
@@ -772,5 +788,32 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod measure_closure_tests {
+    use super::*;
+    use crate::px;
+    use std::rc::Rc;
+
+    #[test]
+    fn clear_drops_measure_closures_and_their_captures() {
+        let mut engine = TaffyLayoutEngine::new();
+        let captured = Rc::new(());
+        let inner = captured.clone();
+        engine.request_measured_layout(Style::default(), px(16.), 1., move |_, _, _, _| {
+            let _keep = &inner;
+            Size::default()
+        });
+        assert_eq!(engine.measured_node_count(), 1);
+        assert_eq!(Rc::strong_count(&captured), 2);
+        engine.clear();
+        assert_eq!(
+            Rc::strong_count(&captured),
+            1,
+            "the previous frame's measure closures must not outlive the frame"
+        );
+        assert_eq!(engine.measured_node_count(), 0);
     }
 }
