@@ -1176,6 +1176,7 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    draw_completion_callbacks: Vec<FrameCallback>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1869,6 +1870,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            draw_completion_callbacks: Vec::new(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2422,6 +2424,20 @@ impl Window {
     /// await points in async code.
     pub fn to_async(&self, cx: &App) -> AsyncWindowContext {
         AsyncWindowContext::new_context(cx.to_async(), self.handle)
+    }
+
+    /// Registers a callback during paint to run once at the end of this draw.
+    /// All elements, including deferred elements, have painted and the rendered
+    /// frame and focus listeners have been updated before these callbacks run.
+    /// Callbacks run in registration order before `draw` returns. They do not
+    /// request another frame and are not repeated by cached paint replay.
+    ///
+    /// Use this to finalize native data collected during paint. It is not a
+    /// drawing phase or a notification that pixels reached the display. Frame
+    /// metadata read by a callback must have been captured during painting.
+    pub fn on_draw_complete(&mut self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        self.invalidator.debug_assert_paint();
+        self.draw_completion_callbacks.push(Box::new(callback));
     }
 
     /// Schedule the given closure to be run directly after the current frame is rendered.
@@ -3072,6 +3088,10 @@ impl Window {
             self.refresh();
         }
         self.needs_present.set(true);
+
+        for callback in mem::take(&mut self.draw_completion_callbacks) {
+            callback(self, cx);
+        }
 
         #[cfg(feature = "profiler")]
         {

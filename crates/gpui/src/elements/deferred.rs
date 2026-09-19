@@ -363,4 +363,72 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| assert_eq!(cx.global::<ContextLog>().0, vec![11, 0, 22]));
     }
+
+    fn completion_probe(index: usize) -> impl IntoElement {
+        div()
+            .w(px(10.))
+            .h(px(10.))
+            .debug_selector(move || format!("complete-{index}").into())
+            .on_painted(move |_, window, cx| {
+                cx.global_mut::<ContextLog>().0.push(index);
+                window.on_draw_complete(move |window, cx| {
+                    assert!(
+                        window
+                            .rendered_frame
+                            .debug_bounds
+                            .contains_key(&format!("complete-{index}"))
+                    );
+                    assert!(window.element_context::<usize>().is_none());
+                    cx.global_mut::<ContextLog>().0.push(index + 10);
+                });
+            })
+    }
+    struct CompletionView;
+    impl Render for CompletionView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(completion_probe(1)).child(
+                deferred(
+                    div()
+                        .child(completion_probe(2))
+                        .child(deferred(completion_probe(3)).with_priority(2)),
+                )
+                .with_priority(1),
+            )
+        }
+    }
+    #[gpui::test]
+    fn test_draw_completion_follows_all_deferred_paint(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(ContextLog::default()));
+        let handle = cx.add_window(|_, _| CompletionView);
+        for _ in 0..2 {
+            cx.update_window(handle.into(), |_, window, cx| {
+                cx.global_mut::<ContextLog>().0.clear();
+                window.draw(cx).clear(cx);
+                assert_eq!(cx.global::<ContextLog>().0, vec![1, 2, 3, 11, 12, 13]);
+                assert!(!window.invalidator.is_dirty());
+            })
+            .unwrap();
+        }
+    }
+
+    struct CachedCompletionRoot(Entity<CompletionView>);
+    impl Render for CachedCompletionRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+        }
+    }
+    #[gpui::test]
+    fn test_draw_completion_is_not_repeated_by_cached_paint(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(ContextLog::default()));
+        let handle = cx.add_window(|_, cx| CachedCompletionRoot(cx.new(|_| CompletionView)));
+        cx.run_until_parked();
+        for _ in 0..2 {
+            cx.update(|cx| cx.global_mut::<ContextLog>().0.clear());
+            handle.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| assert!(cx.global::<ContextLog>().0.is_empty()));
+        }
+    }
 }

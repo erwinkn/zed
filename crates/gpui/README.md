@@ -135,3 +135,13 @@ alive in retained deferred draw records until GPUI discards those records.
 They do not invalidate cached views. Cached paint replay does not call element
 callbacks again. The caller must invalidate views when a context change affects
 cached content.
+
+### Draw completion
+
+Call `Window::on_draw_complete` during paint to register a one-time native
+callback. It runs after all painting, frame installation, and focus listeners,
+but before `Window::draw` returns. Callbacks run in registration order. Use this
+to finish data collected across ordinary and deferred paint callbacks. It does
+not request another frame, wait for JavaScript, or confirm OS presentation.
+The callback is outside the drawing scope; capture any required draw context
+when registering it. Cached paint replay does not register the callback again.
