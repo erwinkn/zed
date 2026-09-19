@@ -96,3 +96,15 @@ In addition to the systems above, GPUI provides a range of smaller services that
 - The `[gpui::test]` macro provides a convenient way to write tests for your GPUI applications. Tests also have their own kind of context, a `TestAppContext` which provides ways of simulating common platform input. See `app::test_context` and `test` modules for more details.
 
 Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
+
+### List height hints
+
+`ListState::splice_with_uniform_height(range, count, height)` inserts rows with
+an initial height hint while preserving measurements outside the replaced range.
+`splice_focusable_with_uniform_height(range, focus_handles, height)` also accepts
+focus ownership for each new row. Both retain the normal splice anchor rules.
+Use them when appending or replacing rows whose heights are not yet measured.
+
+`with_uniform_item_height` fills missing hints and preserves measured entries.
+It traverses the index, so it is intended for initialization. Use a hinted splice
+for incremental updates. Actual layout measurements replace the hints.

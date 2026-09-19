@@ -382,16 +382,20 @@ impl ListState {
             height,
         };
         let mut state = self.0.borrow_mut();
-        let new_items = state
-            .items
-            .iter()
-            .map(|item| ListItem::Unmeasured {
-                size_hint: Some(item.size_hint().unwrap_or(size_hint)),
-                focus_handle: item.focus_handle(),
-            })
-            .collect::<Vec<_>>();
         let mut tree = SumTree::default();
-        tree.extend(new_items, ());
+        tree.extend(
+            state.items.iter().map(|item| match item {
+                ListItem::Unmeasured {
+                    size_hint: None,
+                    focus_handle,
+                } => ListItem::Unmeasured {
+                    size_hint: Some(size_hint),
+                    focus_handle: focus_handle.clone(),
+                },
+                _ => item.clone(),
+            }),
+            (),
+        );
         state.items = tree;
     }
 
@@ -506,6 +510,27 @@ impl ListState {
         self.splice_focusable(old_range, (0..count).map(|_| None))
     }
 
+    /// Replace a range with uniformly hinted, initially unmeasured items.
+    /// Existing items keep their measurements and scroll-anchor behavior.
+    pub fn splice_with_uniform_height(
+        &self,
+        old_range: Range<usize>,
+        count: usize,
+        height: Pixels,
+    ) {
+        self.splice_focusable_with_uniform_height(old_range, (0..count).map(|_| None), height);
+    }
+
+    /// Splice focusable rows with a height hint for each newly inserted item.
+    pub fn splice_focusable_with_uniform_height(
+        &self,
+        old_range: Range<usize>,
+        focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+        height: Pixels,
+    ) {
+        self.splice_with_uniform_hint(old_range, focus_handles, Some(height));
+    }
+
     /// Register with the list state that the items in `old_range` have been replaced
     /// by new items. As opposed to [`Self::splice`], this method allows an iterator of optional focus handles
     /// to be supplied to properly integrate with items in the list that can be focused. If a focused item
@@ -515,6 +540,19 @@ impl ListState {
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
     ) {
+        self.splice_with_uniform_hint(old_range, focus_handles, None);
+    }
+
+    fn splice_with_uniform_hint(
+        &self,
+        old_range: Range<usize>,
+        focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+        height: Option<Pixels>,
+    ) {
+        let size_hint = height.map(|height| Size {
+            width: px(0.),
+            height,
+        });
         let state = &mut *self.0.borrow_mut();
 
         let mut old_items = state.items.cursor::<Count>(());
@@ -526,7 +564,7 @@ impl ListState {
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle,
                 }
             }),
@@ -3057,6 +3095,76 @@ mod test {
              the bottom of its track, even when content has grown during the drag \
              (so frozen_bottom < live_bottom)"
         );
+    }
+
+    struct HintTestView(ListState);
+    impl Render for HintTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            list(self.0.clone(), |_, _, _| {
+                div().h(px(40.)).w_full().into_any()
+            })
+            .w_full()
+            .h_full()
+        }
+    }
+
+    #[gpui::test]
+    fn test_uniform_hint_updates_preserve_measured_items(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(100, crate::ListAlignment::Top, px(0.))
+            .with_uniform_item_height(px(20.));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| HintTestView(state.clone())).into_any_element()
+        });
+        let before = state.0.borrow().items.summary().rendered_count;
+        assert!(before > 0);
+        state.clone().with_uniform_item_height(px(20.));
+        assert_eq!(
+            state.0.borrow().items.summary().rendered_count,
+            before,
+            "adding hints must not discard completed measurements"
+        );
+    }
+
+    #[gpui::test]
+    fn test_hinted_splice_preserves_other_measurements_and_anchor(cx: &mut TestAppContext) {
+        let focus = cx
+            .new(|cx| cx.focus_handle())
+            .read_with(cx, |handle, _| handle.clone());
+        let cx = cx.add_empty_window();
+        let state = ListState::new(100, crate::ListAlignment::Top, px(0.))
+            .with_uniform_item_height(px(20.));
+        state.set_item_focus_handles(0, std::iter::once(Some(focus.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| HintTestView(state.clone())).into_any_element()
+        });
+        let measured = state.0.borrow().items.summary().rendered_count;
+        let height = state.0.borrow().items.summary().height;
+        state.scroll_to(crate::ListOffset {
+            item_ix: 50,
+            offset_in_item: px(7.),
+        });
+        state.splice_focusable_with_uniform_height(10..10, [Some(focus.clone()), None], px(25.));
+        {
+            let state = state.0.borrow();
+            assert_eq!(state.items.summary().rendered_count, measured);
+            assert_eq!(state.items.summary().height, height + px(50.));
+            assert!(!state.items.summary().has_unknown_height);
+            let first = state.items.iter().next().unwrap();
+            assert!(first.size().is_some());
+            assert_eq!(first.focus_handle(), Some(focus.clone()));
+            let inserted = state.items.iter().nth(10).unwrap();
+            assert_eq!(inserted.size(), None);
+            assert_eq!(inserted.size_hint().unwrap().height, px(25.));
+            assert_eq!(inserted.focus_handle(), Some(focus));
+        }
+        assert_eq!(state.logical_scroll_top().item_ix, 52);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(7.));
+        state.splice_with_uniform_height(10..12, 0, px(25.));
+        assert_eq!(state.item_count(), 100);
+        assert_eq!(state.0.borrow().items.summary().rendered_count, measured);
+        assert_eq!(state.0.borrow().items.summary().height, height);
+        assert_eq!(state.logical_scroll_top().item_ix, 50);
     }
 
     #[gpui::test]
